@@ -17,6 +17,7 @@ import (
 
 	"github.com/vta-itsec/devin-to-api/internal/adapter"
 	"github.com/vta-itsec/devin-to-api/internal/adapter/devin"
+	"github.com/vta-itsec/devin-to-api/internal/adapter/devinacp"
 	"github.com/vta-itsec/devin-to-api/internal/app"
 	"github.com/vta-itsec/devin-to-api/internal/config"
 	"github.com/vta-itsec/devin-to-api/internal/dashboard"
@@ -49,6 +50,22 @@ func main() {
 		log.Fatal(createErr)
 	}
 	var providerAdapter adapter.Adapter = configured
+	if serviceConfig.Devin.Backend == "acp" {
+		acpAdapter, acpErr := devinacp.New(devinacp.Config{
+			Bin:         serviceConfig.Devin.AcpBin,
+			WorkDir:     serviceConfig.Devin.Workspace,
+			Model:       serviceConfig.Devin.Model,
+			Mode:        serviceConfig.Devin.AcpMode,
+			StateFile:   serviceConfig.Devin.AcpStateFile,
+			Models:      configured,
+		})
+		if acpErr != nil {
+			log.Fatal(acpErr)
+		}
+		providerAdapter = acpAdapter
+		log.Printf("upstream backend: acp (bin=%s, workspace=%s, mode=%s, sessions=%d)",
+			serviceConfig.Devin.AcpBin, serviceConfig.Devin.Workspace, serviceConfig.Devin.AcpMode, acpAdapter.SessionCount())
+	}
 	log.Printf("upstream auth: %s (model=%s)", serviceConfig.Devin.AuthSource, serviceConfig.Devin.Model)
 	if ok, detail := configured.AuthStatus(); !ok {
 		log.Printf("WARNING: no Devin session token found at %s — run `devin auth login`, then requests work without a restart", detail)

@@ -7,6 +7,18 @@ debug:
   enabled: false
 
 devin:
+  # ====== 上游后端 ======
+  # "connect"（默认）：直连 GetChatMessage RPC，每请求一个新 trajectory ——
+  #   无状态，靠客户端重放历史维持多轮。
+  # "acp"：spawn `devin acp` 子进程，按消息链前缀把同一对话挂到同一个
+  #   devin CLI 会话（session/new + session/load）—— 服务端会话持久，
+  #   devin 可在 workspace 内使用自身 fs/exec 工具。需要机器上有 devin CLI。
+  # backend: "acp"
+  # acp_bin: "devin"                  # devin 可执行文件
+  # workspace: "~/.devin-to-api/workspace"  # ACP 会话 cwd + fs 工具范围
+  # acp_mode: "bypass"                # 权限模式：bypass/smart/ask/plan/accept-edits
+  # acp_state_file: ""                # 对话→会话映射；默认 <workspace>/.devin-to-api-sessions.json
+
   # 上游 Devin Connect 服务地址；默认 https://server.codeium.com，
   # credentials.toml 中的 api_server_url 也会作为兜底。
   # base_url: "https://server.codeium.com"

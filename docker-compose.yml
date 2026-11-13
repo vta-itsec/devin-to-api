@@ -13,11 +13,21 @@ services:
       - ~/.local/share/devin:/home/devin/.local/share/devin
       # Container-only login alternative (then: docker compose exec devin-to-api devin auth login):
       # - devin-data:/home/devin/.local/share/devin
+      # ACP backend workspace: devin's fs/exec tools see this dir, and the
+      # conversation→session map persists here. Mount your project code to
+      # let sessions read/edit it, e.g. ./workspace:/home/devin/workspace
+      - ./workspace:/home/devin/workspace
       # Optional: your own config file instead of docker/config.yaml
       # - ./config.yaml:/etc/devin-to-api/config.yaml:ro
     environment:
       # API key clients must present for /v1/* (VS Code "apiKey" field).
       PROXY_API_KEY: ${PROXY_API_KEY:-}
+      # "acp" = persistent devin CLI session per conversation (recommended for
+      # VS Code chats); "connect" = stateless upstream call per request.
+      DEVIN_BACKEND: ${DEVIN_BACKEND:-acp}
+      DEVIN_WORKSPACE: ${DEVIN_WORKSPACE:-/home/devin/workspace}
+      # ACP permission mode: bypass/smart/ask/plan/accept-edits
+      DEVIN_ACP_MODE: ${DEVIN_ACP_MODE:-bypass}
       # Alternative to the volume above:
       # DEVIN_SESSION_TOKEN: ${DEVIN_SESSION_TOKEN:-}
     restart: unless-stopped

@@ -1,4 +1,5 @@
 /config.yaml
+/workspace/
 .env
 logs/
 *.log

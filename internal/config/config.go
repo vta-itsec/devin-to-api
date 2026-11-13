@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/vta-itsec/devin-to-api/internal/devinauth"
 	"gopkg.in/yaml.v3"
@@ -42,6 +44,18 @@ type ServerConfig struct {
 
 // DevinConfig 保存 Devin Connect 上游调用配置。
 type DevinConfig struct {
+	// Backend 选择上游驱动："connect"（默认，直连 GetChatMessage RPC，每请求新 trajectory）
+	// 或 "acp"（`devin acp` 子进程，按对话前缀绑定持久 devin 会话）。
+	Backend string `yaml:"backend"`
+	// AcpBin 是 devin 可执行文件路径；默认 "devin"（走 PATH）。
+	AcpBin string `yaml:"acp_bin"`
+	// Workspace 是 ACP 后端的工作目录：devin fs/exec 工具可见范围，也是会话 cwd。
+	Workspace string `yaml:"workspace"`
+	// AcpMode 是会话权限模式（bypass/smart/ask/plan/accept-edits）；默认 bypass。
+	AcpMode string `yaml:"acp_mode"`
+	// AcpStateFile 持久化对话→devin 会话映射；默认 <workspace>/.devin-to-api-sessions.json。
+	AcpStateFile string `yaml:"acp_state_file"`
+
 	// BaseURL 是 Devin Connect 服务的基础地址。
 	BaseURL string `yaml:"base_url"`
 	// Token 是 Devin session token；不会写入日志。
@@ -126,6 +140,18 @@ func (config *Config) applyEnv() {
 	if v := os.Getenv("DEVIN_PROXY"); v != "" {
 		config.Devin.Proxy = v
 	}
+	if v := os.Getenv("DEVIN_BACKEND"); v != "" {
+		config.Devin.Backend = v
+	}
+	if v := os.Getenv("DEVIN_ACP_BIN"); v != "" {
+		config.Devin.AcpBin = v
+	}
+	if v := os.Getenv("DEVIN_WORKSPACE"); v != "" {
+		config.Devin.Workspace = v
+	}
+	if v := os.Getenv("DEVIN_ACP_MODE"); v != "" {
+		config.Devin.AcpMode = v
+	}
 	if v := os.Getenv("PROXY_API_KEY"); v != "" {
 		config.Auth.APIKey = v
 	}
@@ -170,6 +196,25 @@ func (config *Config) Validate() error {
 	}
 	if config.Devin.Model == "" {
 		config.Devin.Model = DefaultModel
+	}
+	switch strings.ToLower(strings.TrimSpace(config.Devin.Backend)) {
+	case "":
+		config.Devin.Backend = "connect"
+	case "connect", "acp":
+		config.Devin.Backend = strings.ToLower(config.Devin.Backend)
+	default:
+		return fmt.Errorf("devin.backend must be \"connect\" or \"acp\", got %q", config.Devin.Backend)
+	}
+	if config.Devin.Backend == "acp" {
+		if config.Devin.AcpBin == "" {
+			config.Devin.AcpBin = "devin"
+		}
+		if config.Devin.Workspace == "" {
+			config.Devin.Workspace = filepath.Join(os.Getenv("HOME"), ".devin-to-api", "workspace")
+		}
+		if config.Devin.AcpMode == "" {
+			config.Devin.AcpMode = "bypass"
+		}
 	}
 	return nil
 }

@@ -3,6 +3,11 @@
 Hướng dẫn kết nối VS Code Copilot Chat tới **devin-to-api** qua file cấu
 hình custom language models.
 
+> **Session mode:** với backend `acp` (mặc định trong docker-compose), mỗi
+> *chat mới* trong VS Code được gắn một **devin CLI session riêng** — Devin
+> giữ context server-side giữa các turn, không cần client gửi lại toàn bộ
+> history. Chi tiết: [README — Backends](../README.md#backends-connect-vs-acp-session-mode).
+
 ## 1. Vị trí file
 
 | OS | Path |

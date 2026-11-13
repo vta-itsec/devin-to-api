@@ -25,6 +25,36 @@ Adapted from [`leookun/devin-2api`](https://github.com/leookun/devin-2api)
 All three support streaming (SSE) and non-streaming, tool calling, and
 vision-capable models.
 
+## Backends: `connect` vs `acp` (session mode)
+
+The proxy can drive Devin two ways — pick with `devin.backend` /
+`DEVIN_BACKEND`:
+
+| | `connect` (stateless) | `acp` (**session mode, Docker default**) |
+| --- | --- | --- |
+| Mechanism | Direct `GetChatMessage` Connect RPC | `devin acp` subprocess per turn (Agent Client Protocol), sessions via `session/new` + `session/load` |
+| Context | Each request is a brand-new trajectory; multi-turn works only because the client replays full history | **One Devin CLI session per conversation** — Devin keeps its own transcript server-side; only the *new* turn is sent |
+| Tools | Client-declared tools forwarded to the model | Devin's own tools (fs/exec) run inside `workspace` — it can read your code to answer |
+| Needs | `credentials.toml` token | `credentials.toml` token **+ `devin` binary** |
+
+**How conversations map to sessions (acp):** the proxy hashes the message
+history chain and matches the longest prefix against registered sessions.
+A VS Code *new chat* has no matching prefix → fresh `devin` session; follow-up
+turns in that chat extend the same chain → same `devin` session via
+`session/load`. The map persists in
+`<workspace>/.devin-to-api-sessions.json`, so a proxy restart does not lose
+conversations, and the underlying Devin sessions also show up in
+`devin list`. Two chats that literally start with the identical first message
+are ambiguous — the proxy starts a fresh session rather than mixing contexts.
+An identical repeated request replays the cached reply instead of spending a
+new turn.
+
+**ACP workspace:** `devin.workspace` (`DEVIN_WORKSPACE`, Docker default
+`/home/devin/workspace`) is the session cwd *and* the only directory Devin's
+file tools may touch. Mount a project into it (`./workspace` is already
+bind-mounted in `docker-compose.yml`) to chat about real code.
+`devin.acp_mode` (`bypass` by default) controls Devin's permission mode.
+
 ## How authentication works
 
 `devin auth login` writes `~/.local/share/devin/credentials.toml`:
@@ -194,6 +224,11 @@ env-only works, which is how the Docker image runs.
 | --- | --- | --- | --- |
 | `server.listen` | `DEVIN_TO_API_LISTEN` | `:8080` | HTTP listen address |
 | `server.max_concurrency` | — | `1024` | Concurrent `/v1/*` requests cap |
+| `devin.backend` | `DEVIN_BACKEND` | `connect` (`acp` in docker-compose) | `connect` = stateless RPC; `acp` = persistent devin CLI sessions |
+| `devin.acp_bin` | `DEVIN_ACP_BIN` | `devin` | devin executable for the acp backend |
+| `devin.workspace` | `DEVIN_WORKSPACE` | `~/.devin-to-api/workspace` | acp session cwd + fs tool root |
+| `devin.acp_mode` | `DEVIN_ACP_MODE` | `bypass` | Devin session permission mode |
+| `devin.acp_state_file` | — | `<workspace>/.devin-to-api-sessions.json` | Conversation→session map file |
 | `devin.base_url` | `DEVIN_BASE_URL` | `credentials.toml` → `https://server.codeium.com` | Connect API base URL |
 | `devin.token` | `DEVIN_SESSION_TOKEN` | — | Static session token (skips credentials file) |
 | `devin.credentials_file` | `DEVIN_CREDENTIALS_FILE` | `~/.local/share/devin/credentials.toml` | `devin auth login` file, re-read per request |
