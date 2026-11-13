@@ -146,6 +146,9 @@ docker run -d -p 8080:8080 \
 
 ## VS Code custom endpoint
 
+**Full step-by-step guide (file location, `${input:...}` secrets, mixing
+apiTypes, troubleshooting): [docs/vscode-setup.md](docs/vscode-setup.md)**
+
 `PROXY_API_KEY` protects `/v1/*`; VS Code sends it as
 `Authorization: Bearer <key>` via the `apiKey` field. Pick **one** `apiType`
 per model entry — all three are supported:
