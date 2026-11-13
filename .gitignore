@@ -1,0 +1,5 @@
+config.yaml
+.env
+logs/
+*.log
+/tmp/

@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.dockerignore
+docker-compose.yml
+README*
+LICENSE
+CONTRIBUTING.md
+proto/
+config.yaml
+config.example.yaml
+logs/
+*.log
+.env
+Dockerfile
