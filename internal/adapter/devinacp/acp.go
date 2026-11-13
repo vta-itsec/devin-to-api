@@ -36,6 +36,10 @@ type Config struct {
 	StateFile string
 	// SessionTTL 是映射条目的空闲回收时间；默认 7 天。
 	SessionTTL time.Duration
+	// ProcIdleTTL 是常驻 acp 进程的空闲回收时间；默认 15 分钟。
+	ProcIdleTTL time.Duration
+	// ProcMax 是常驻进程池上限；默认 8，超出时淘汰最老空闲进程。
+	ProcMax int
 	// Models 复用 connect adapter 的模型目录实现。
 	Models modelLister
 }
@@ -48,6 +52,9 @@ type modelLister interface {
 type Adapter struct {
 	config Config
 	store  *sessionStore
+	pool   *procPool
+	// warm 缓存已完成 initialize 的待用进程：新会话/首次 load 免 spawn+握手。
+	warm chan *rpcProcess
 }
 
 var _ adapter.Adapter = (*Adapter)(nil)
@@ -76,8 +83,75 @@ func New(config Config) (*Adapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Adapter{config: config, store: store}, nil
+	a := &Adapter{
+		config: config, store: store,
+		pool: newProcPool(config.ProcIdleTTL, config.ProcMax),
+		warm: make(chan *rpcProcess, 2),
+	}
+	go a.keepWarm()
+	return a, nil
 }
+
+// keepWarm 后台补齐待用进程：spawn + initialize 完成后推入 warm。
+// spawn 或握手失败即停止预热（attach 退回按需 spawn，错误照常上报）。
+func (a *Adapter) keepWarm() {
+	for {
+		proc, err := spawnAcp(a.config.Bin, a.config.Model, a.config.WorkDir)
+		if err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
+		_, err = proc.call(ctx, "initialize", map[string]any{
+			"protocolVersion": 1,
+			"clientCapabilities": map[string]any{
+				"fs":       map[string]any{"readTextFile": true, "writeTextFile": true},
+				"terminal": false,
+			},
+		})
+		cancel()
+		if err != nil {
+			proc.kill()
+			return
+		}
+		select {
+		case a.warm <- proc:
+		case <-a.pool.done:
+			proc.kill()
+			return
+		}
+	}
+}
+
+// takeWarm 取一个已握手的待用进程；没有则返回 nil（调用方按需 spawn）。
+func (a *Adapter) takeWarm() *rpcProcess {
+	select {
+	case proc := <-a.warm:
+		return proc
+	default:
+		return nil
+	}
+}
+
+// drainWarm 排空并销毁待用进程（Close 用）。
+func (a *Adapter) drainWarm() {
+	for {
+		select {
+		case proc := <-a.warm:
+			proc.kill()
+		default:
+			return
+		}
+	}
+}
+
+// Close 关闭进程池与待用进程（proxy 退出时调用）。
+func (a *Adapter) Close() {
+	a.pool.close()
+	a.drainWarm()
+}
+
+// ProcCount 返回常驻进程数（健康检查展示）。
+func (a *Adapter) ProcCount() int { return a.pool.size() }
 
 // ListModels 复用 connect adapter 的目录（同一账号）。
 func (a *Adapter) ListModels(ctx context.Context) ([]adapter.ModelInfo, error) {
@@ -182,81 +256,16 @@ func lastAssistantText(messages []llm.Message) string {
 	return ""
 }
 
-// runTurn 执行一轮：spawn → 会话 → prompt → 事件流 → 注册链。
+// runTurn 执行一轮：attach 进程 → prompt → 事件流 → 注册链 → 归还进程池。
 // existing 为 nil 时先试 session/list 收养（state 文件丢失后按首条
 // prompt 的 title 找回 devin 会话），收不到才 session/new。
 // chain 是规范化用户链，incoming 是本次请求原始链（幂等重放依据）。
 func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *session, model string, prompt []map[string]any, chain []string, incoming, conversationID string, messages []llm.Message) {
-	proc, err := spawnAcp(ctx, a.config.Bin, model, a.config.WorkDir)
-	if err != nil {
-		stream.fail(err)
-		return
+	ap, sessionID := a.attach(ctx, stream, existing, model, messages, &prompt)
+	if ap == nil {
+		return // stream.fail 已发出
 	}
-	defer proc.kill()
-
-	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
-	defer cancel()
-	if _, err := proc.call(setupCtx, "initialize", map[string]any{
-		"protocolVersion": 1,
-		"clientCapabilities": map[string]any{
-			"fs":       map[string]any{"readTextFile": true, "writeTextFile": true},
-			"terminal": false,
-		},
-	}); err != nil {
-		stream.fail(fmt.Errorf("acp initialize: %w", err))
-		return
-	}
-
-	cwd, _ := filepath.Abs(a.config.WorkDir)
-	sessParams := func() map[string]any {
-		p := map[string]any{"cwd": cwd, "mcpServers": []any{}}
-		return p
-	}
-	var sessionID string
-	if existing != nil {
-		// session/load 重放历史 update：读响应前先置 loading，拿到结果后清除。
-		proc.loading.Store(true)
-		params := sessParams()
-		params["sessionId"] = existing.ID
-		_, loadErr := proc.call(setupCtx, "session/load", params)
-		proc.loading.Store(false)
-		// load 期间可能还有 update 在管道里，清空。
-		drainUpdates(proc)
-		if loadErr == nil {
-			sessionID = existing.ID
-		}
-	}
-	if sessionID == "" && isContinuation(chain, messages) {
-		// 收养：state 丢失/换机时，按首条用户消息文本找回 devin 会话。
-		// 只对「延续中的对话」收养——裸 turn-1 与现存会话开场相同属于
-		// 新聊天，收养会把别人的 session 抢过来污染上下文。
-		// 收养的会话 transcript 已含全部历史 → prompt 只发最后一条用户消息。
-		if adopted := a.adoptByTitle(setupCtx, proc, cwd, firstUserText(messages)); adopted != "" {
-			sessionID = adopted
-			if lastUser := lastUserPrompt(messages); len(lastUser) > 0 {
-				prompt = lastUser
-			}
-		}
-	}
-	if sessionID == "" {
-		result, err := proc.call(setupCtx, "session/new", sessParams())
-		if err != nil {
-			stream.fail(fmt.Errorf("acp session/new: %w", err))
-			return
-		}
-		var created struct {
-			SessionID string `json:"sessionId"`
-		}
-		if err := json.Unmarshal(result, &created); err != nil || created.SessionID == "" {
-			stream.fail(errors.New("devin opened no session"))
-			return
-		}
-		sessionID = created.SessionID
-	}
-	_, _ = proc.call(setupCtx, "session/set_mode", map[string]any{
-		"sessionId": sessionID, "modeId": a.config.Mode,
-	})
-	cancel() // setup 完成，提示轮由请求 ctx 控制时长
+	proc := ap.proc
 
 	// 流式收集：agent_message_chunk → 文本增量。
 	var reply strings.Builder
@@ -294,6 +303,7 @@ func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *se
 		case err := <-done:
 			if err != nil {
 				stream.fail(err)
+				a.pool.discard(ap)
 				return
 			}
 			// prompt 返回后管道里可能还有最后的 chunk。
@@ -316,15 +326,116 @@ func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *se
 			replyHash := messageHash(llm.AssistantMessage{Content: []llm.Content{llm.TextContent{Text: reply.String()}}})
 			a.store.register(&session{ID: sessionID}, model, conversationID, chain, incoming, replyHash, reply.String())
 			stream.close()
+			a.pool.put(ap) // 健康进程归还池，下轮免 spawn+load
 			return
 		case <-ctx.Done():
 			stream.fail(ctx.Err())
+			a.pool.discard(ap) // 请求取消：进程可能处于半轮状态，不回池
 			return
 		case <-proc.done:
 			stream.fail(errors.New("devin process exited mid-turn"))
+			a.pool.discard(ap)
 			return
 		}
 	}
+}
+
+// attach 获取一个已加载目标会话的常驻进程。
+//   - 池里有该会话的进程 → 直接复用（免 initialize/load，最快路径）。
+//   - 否则 spawn 新进程：initialize → session/load(existing) →
+//     收养(session/list) → session/new → set_mode。
+// existing 为 nil 且收养失败时新建会话。prompt 指针在收养路径被改写为
+// 「最后一条用户消息」。失败时返回 nil 并已 stream.fail。
+func (a *Adapter) attach(ctx context.Context, stream *eventStream, existing *session, model string, messages []llm.Message, prompt *[]map[string]any) (*attachedProc, string) {
+	if existing != nil {
+		if ap := a.pool.get(existing.ID); ap != nil {
+			return ap, existing.ID // 进程里会话已加载——零 setup
+		}
+	}
+	// 优先取待用进程（已 spawn+initialize）；没有才冷启动。
+	// 待用进程以默认 model 启动（--model 是新建会话的默认值）——
+	// 请求显式指定其他 model 时只能冷启动，避免新会话拿错模型。
+	var proc *rpcProcess
+	warmed := false
+	if model == a.config.Model {
+		proc = a.takeWarm()
+		warmed = proc != nil
+	}
+	if proc == nil {
+		var err error
+		proc, err = spawnAcp(a.config.Bin, model, a.config.WorkDir)
+		if err != nil {
+			stream.fail(err)
+			return nil, ""
+		}
+	}
+	discard := func(err error) (*attachedProc, string) {
+		proc.kill()
+		stream.fail(err)
+		return nil, ""
+	}
+
+	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
+	defer cancel()
+	if !warmed {
+		if _, err := proc.call(setupCtx, "initialize", map[string]any{
+			"protocolVersion": 1,
+			"clientCapabilities": map[string]any{
+				"fs":       map[string]any{"readTextFile": true, "writeTextFile": true},
+				"terminal": false,
+			},
+		}); err != nil {
+			return discard(fmt.Errorf("acp initialize: %w", err))
+		}
+	}
+
+	cwd, _ := filepath.Abs(a.config.WorkDir)
+	sessParams := func() map[string]any {
+		return map[string]any{"cwd": cwd, "mcpServers": []any{}}
+	}
+	var sessionID string
+	if existing != nil {
+		// session/load 重放历史 update：读响应前先置 loading，拿到结果后清除；
+		// 随后 drainQuiet 吃掉仍在管道里的重放尾巴（防旧 chunk 漏进新回复）。
+		proc.loading.Store(true)
+		params := sessParams()
+		params["sessionId"] = existing.ID
+		_, loadErr := proc.call(setupCtx, "session/load", params)
+		proc.loading.Store(false)
+		drainQuiet(proc)
+		if loadErr == nil {
+			sessionID = existing.ID
+		}
+	}
+	if sessionID == "" && isContinuation(userChainOf(messages), messages) {
+		// 收养：state 丢失/换机时，按首条用户消息文本找回 devin 会话。
+		// 只对「延续中的对话」收养——裸 turn-1 与现存会话开场相同属于
+		// 新聊天，收养会把别人的 session 抢过来污染上下文。
+		// 收养的会话 transcript 已含全部历史 → prompt 只发最后一条用户消息。
+		if adopted := a.adoptByTitle(setupCtx, proc, cwd, firstUserText(messages)); adopted != "" {
+			sessionID = adopted
+			if lastUser := lastUserPrompt(messages); len(lastUser) > 0 {
+				*prompt = lastUser
+			}
+		}
+	}
+	if sessionID == "" {
+		result, err := proc.call(setupCtx, "session/new", sessParams())
+		if err != nil {
+			return discard(fmt.Errorf("acp session/new: %w", err))
+		}
+		var created struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(result, &created); err != nil || created.SessionID == "" {
+			return discard(errors.New("devin opened no session"))
+		}
+		sessionID = created.SessionID
+	}
+	_, _ = proc.call(setupCtx, "session/set_mode", map[string]any{
+		"sessionId": sessionID, "modeId": a.config.Mode,
+	})
+	return &attachedProc{proc: proc, sessionID: sessionID, model: model}, sessionID
 }
 
 // isContinuation 报告请求是否是一次「对话延续」（≥2 条用户消息或带助手
@@ -426,18 +537,29 @@ func (a *Adapter) adoptByTitle(ctx context.Context, proc *rpcProcess, cwd, first
 		"sessionId": hit, "cwd": cwd, "mcpServers": []any{},
 	})
 	proc.loading.Store(false)
-	drainUpdates(proc)
+	drainQuiet(proc)
 	if err != nil {
 		return ""
 	}
 	return hit
 }
 
-func drainUpdates(proc *rpcProcess) {
+// drainQuiet 排空 updates 队列直到安静 150ms（上限 5s）。
+// session/load 的响应可能在重放 update 全部刷完前返回，残留的 replay
+// 若不排干净会被当作新一轮 chunk 漏进回复（用户看到的 "Analyzing" 之类）。
+func drainQuiet(proc *rpcProcess) {
+	deadline := time.After(5 * time.Second)
+	quiet := time.NewTimer(150 * time.Millisecond)
 	for {
 		select {
 		case <-proc.updates:
-		default:
+			if !quiet.Stop() {
+				<-quiet.C
+			}
+			quiet.Reset(150 * time.Millisecond)
+		case <-quiet.C:
+			return
+		case <-deadline:
 			return
 		}
 	}

@@ -32,7 +32,7 @@ The proxy can drive Devin two ways — pick with `devin.backend` /
 
 | | `connect` (stateless) | `acp` (**session mode, Docker default**) |
 | --- | --- | --- |
-| Mechanism | Direct `GetChatMessage` Connect RPC | `devin acp` subprocess per turn (Agent Client Protocol), sessions via `session/new` + `session/load` |
+| Mechanism | Direct `GetChatMessage` Connect RPC | Resident `devin acp` subprocess per session (Agent Client Protocol), sessions via `session/new` + `session/load` |
 | Context | Each request is a brand-new trajectory; multi-turn works only because the client replays full history | **One Devin CLI session per conversation** — Devin keeps its own transcript server-side; only the *new* turn is sent |
 | Tools | Client-declared tools forwarded to the model | Devin's own tools (fs/exec) run inside `workspace` — it can read your code to answer |
 | Needs | `credentials.toml` token | `credentials.toml` token **+ `devin` binary** |
@@ -85,6 +85,15 @@ chain because clients may reformat them (thinking blocks, reordering).
 file tools may touch. Mount a project into it (`./workspace` is already
 bind-mounted in `docker-compose.yml`) to chat about real code.
 `devin.acp_mode` (`bypass` by default) controls Devin's permission mode.
+
+**Speed:** each Devin session keeps a *resident* `devin acp` process —
+`initialize` + `session/load` (which replays the whole transcript) happen
+only on the first turn of a session; later turns go straight to
+`session/prompt`. Idle processes are reaped after `devin.acp_proc_idle`
+(`DEVIN_ACP_PROC_IDLE`, default `15m`), the pool is capped at
+`devin.acp_proc_max` (`DEVIN_ACP_PROC_MAX`, default `8`) with LRU eviction,
+and up to 2 spare processes are pre-warmed (spawn + handshake done) so even
+brand-new chats skip the cold start.
 
 ## How authentication works
 

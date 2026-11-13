@@ -18,6 +18,8 @@ devin:
   # workspace: "~/.devin-to-api/workspace"  # ACP 会话 cwd + fs 工具范围
   # acp_mode: "bypass"                # 权限模式：bypass/smart/ask/plan/accept-edits
   # acp_state_file: ""                # 对话→会话映射；默认 <workspace>/.devin-to-api-sessions.json
+  # acp_proc_idle: "15m"              # 常驻 devin acp 进程空闲回收时长（会话进程复用，免每轮 spawn+load）
+  # acp_proc_max: 8                   # 常驻进程数上限，超出淘汰最老空闲进程
 
   # 上游 Devin Connect 服务地址；默认 https://server.codeium.com，
   # credentials.toml 中的 api_server_url 也会作为兜底。

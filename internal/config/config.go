@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/vta-itsec/devin-to-api/internal/devinauth"
@@ -55,6 +56,11 @@ type DevinConfig struct {
 	AcpMode string `yaml:"acp_mode"`
 	// AcpStateFile 持久化对话→devin 会话映射；默认 <workspace>/.devin-to-api-sessions.json。
 	AcpStateFile string `yaml:"acp_state_file"`
+	// AcpProcIdle 是常驻 devin acp 进程的空闲回收时长（如 "15m"）；默认 15m。
+	// 常驻进程免除每轮的 spawn + session/load 重放开销。
+	AcpProcIdle string `yaml:"acp_proc_idle"`
+	// AcpProcMax 是常驻进程数上限；默认 8，超出时淘汰最老空闲进程。
+	AcpProcMax int `yaml:"acp_proc_max"`
 
 	// BaseURL 是 Devin Connect 服务的基础地址。
 	BaseURL string `yaml:"base_url"`
@@ -151,6 +157,14 @@ func (config *Config) applyEnv() {
 	}
 	if v := os.Getenv("DEVIN_ACP_MODE"); v != "" {
 		config.Devin.AcpMode = v
+	}
+	if v := os.Getenv("DEVIN_ACP_PROC_IDLE"); v != "" {
+		config.Devin.AcpProcIdle = v
+	}
+	if v := os.Getenv("DEVIN_ACP_PROC_MAX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			config.Devin.AcpProcMax = n
+		}
 	}
 	if v := os.Getenv("PROXY_API_KEY"); v != "" {
 		config.Auth.APIKey = v

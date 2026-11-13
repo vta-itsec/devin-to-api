@@ -51,20 +51,34 @@ func main() {
 	}
 	var providerAdapter adapter.Adapter = configured
 	if serviceConfig.Devin.Backend == "acp" {
+		procIdle := 15 * time.Minute
+		if serviceConfig.Devin.AcpProcIdle != "" {
+			if d, err := time.ParseDuration(serviceConfig.Devin.AcpProcIdle); err == nil && d > 0 {
+				procIdle = d
+			}
+		}
 		acpAdapter, acpErr := devinacp.New(devinacp.Config{
 			Bin:         serviceConfig.Devin.AcpBin,
 			WorkDir:     serviceConfig.Devin.Workspace,
 			Model:       serviceConfig.Devin.Model,
 			Mode:        serviceConfig.Devin.AcpMode,
 			StateFile:   serviceConfig.Devin.AcpStateFile,
+			ProcIdleTTL: procIdle,
+			ProcMax:     serviceConfig.Devin.AcpProcMax,
 			Models:      configured,
 		})
 		if acpErr != nil {
 			log.Fatal(acpErr)
 		}
+		defer acpAdapter.Close()
 		providerAdapter = acpAdapter
-		log.Printf("upstream backend: acp (bin=%s, workspace=%s, mode=%s, sessions=%d)",
-			serviceConfig.Devin.AcpBin, serviceConfig.Devin.Workspace, serviceConfig.Devin.AcpMode, acpAdapter.SessionCount())
+		procMax := serviceConfig.Devin.AcpProcMax
+		if procMax <= 0 {
+			procMax = 8
+		}
+		log.Printf("upstream backend: acp (bin=%s, workspace=%s, mode=%s, sessions=%d, proc_pool idle=%s max=%d)",
+			serviceConfig.Devin.AcpBin, serviceConfig.Devin.Workspace, serviceConfig.Devin.AcpMode,
+			acpAdapter.SessionCount(), procIdle, procMax)
 	}
 	log.Printf("upstream auth: %s (model=%s)", serviceConfig.Devin.AuthSource, serviceConfig.Devin.Model)
 	if ok, detail := configured.AuthStatus(); !ok {

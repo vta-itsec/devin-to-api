@@ -59,12 +59,14 @@ type rpcError struct {
 }
 
 // spawnAcp 启动 `devin acp --model <model>` 并开始读取其 stdout。
-func spawnAcp(ctx context.Context, bin, model, workDir string) (*rpcProcess, error) {
+// 进程生命周期独立于单个请求（常驻池化复用），所以不绑定请求 ctx；
+// 由调用方在出错/废弃时显式 kill，或由池的 reaper 回收。
+func spawnAcp(bin, model, workDir string) (*rpcProcess, error) {
 	args := []string{"acp"}
 	if model != "" {
 		args = append(args, "--model", model)
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.Command(bin, args...)
 	cmd.Dir = workDir
 	// 杀掉进程组，避免 acp 子进程（MCP server 等）泄漏。
 	cmd.WaitDelay = 10 * time.Second
