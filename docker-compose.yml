@@ -33,6 +33,9 @@ services:
       # Devin Cloud API key for /v1/sessions* passthrough (api.devin.ai).
       # Leave empty to forward the client's own Bearer token instead.
       DEVIN_API_KEY: ${DEVIN_API_KEY:-}
+      # Upstream base URL for /v1/sessions* — set to enable the endpoints even
+      # without a server-side key (clients then pass X-Devin-Api-Key).
+      DEVIN_CLOUD_BASE_URL: ${DEVIN_CLOUD_BASE_URL:-}
       # Optional default snapshot injected into POST /v1/sessions when the
       # request omits snapshot_id.
       DEVIN_CLOUD_SNAPSHOT_ID: ${DEVIN_CLOUD_SNAPSHOT_ID:-}
