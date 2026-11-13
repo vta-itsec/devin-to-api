@@ -3,7 +3,7 @@ services:
     build: .
     image: devin-to-api:latest
     ports:
-      - "8080:8080"
+      - "${BIND:-0.0.0.0}:${PORT:-8080}:8080"
     volumes:
       # Shares `devin auth login` state between host and container:
       # log in on either side and the proxy picks the token up live.

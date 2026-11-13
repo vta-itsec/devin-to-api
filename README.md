@@ -15,7 +15,7 @@ Adapted from [`leookun/devin-2api`](https://github.com/leookun/devin-2api)
 
 | Endpoint | Protocol | VS Code `apiType` |
 | --- | --- | --- |
-| `POST /v1/chat/completions` | OpenAI Chat Completions | `"chat completions"` |
+| `POST /v1/chat/completions` | OpenAI Chat Completions | `"chat-completions"` |
 | `POST /v1/responses` | OpenAI Responses (+ WebSocket on `GET`) | `"responses"` |
 | `POST /v1/messages` | Anthropic Messages | `"messages"` |
 | `GET /v1/models` `GET /v1/models/{id}` | OpenAI model list | — |
@@ -172,7 +172,7 @@ per model entry — all three are supported:
 
 Swap `"apiType"`/`"url"` for the other protocols:
 
-- `"chat completions"` → `"url": "http://localhost:8080/v1/chat/completions"`
+- `"chat-completions"` → `"url": "http://localhost:8080/v1/chat/completions"`
 - `"responses"` → `"url": "http://localhost:8080/v1/responses"`
 - `"messages"` → `"url": "http://localhost:8080/v1/messages"`
 
