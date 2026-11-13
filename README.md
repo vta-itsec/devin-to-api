@@ -42,6 +42,38 @@ session creation via `devin_cloud.snapshot_id` /
 wins). These are **async cloud Devins**, not chat replies — poll
 `GET /v1/sessions/{id}` for status.
 
+### `devin-cloud` chat model (cloud Devin as a VS Code model)
+
+When `devin_cloud` is configured, any chat request whose model is
+`devin-cloud` is routed to a dedicated adapter that maps the conversation to
+a **Devin Cloud session**:
+
+- first turn → `POST api.devin.ai/v1/sessions` (prompt = transcript,
+  `snapshot_id` from `devin_cloud.snapshot_id` or a per-request override via
+  model id `devin-cloud@snapshot-xxx`)
+- next turns → `POST /v1/sessions/{id}/message` with just the new turn
+- the adapter polls `GET /v1/sessions/{id}` until `finished`/`blocked` and
+  returns the session output as the chat reply; progress shows up as
+  thinking deltas while streaming (cloud turns take minutes — use
+  streaming)
+
+Conversation→session mapping persists in
+`<workspace>/.devin-to-api-cloud-sessions.json` (same chain-matching idea as
+the acp backend; identical openings get separate sessions). Cloud sessions
+are autonomous — they consume ACU and run unattended, so use deliberately.
+
+VS Code entry — just add another model under the same custom endpoint:
+
+```json
+{
+    "id": "devin-cloud",
+    "name": "Devin Cloud Session",
+    "url": "http://<host>:8080/v1/chat/completions",
+    "toolCalling": false,
+    "vision": false
+}
+```
+
 ## Backends: `connect` vs `acp` (session mode)
 
 The proxy can drive Devin two ways — pick with `devin.backend` /

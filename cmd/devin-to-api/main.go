@@ -18,6 +18,7 @@ import (
 	"github.com/vta-itsec/devin-to-api/internal/adapter"
 	"github.com/vta-itsec/devin-to-api/internal/adapter/devin"
 	"github.com/vta-itsec/devin-to-api/internal/adapter/devinacp"
+	"github.com/vta-itsec/devin-to-api/internal/adapter/devincloud"
 	"github.com/vta-itsec/devin-to-api/internal/app"
 	"github.com/vta-itsec/devin-to-api/internal/config"
 	"github.com/vta-itsec/devin-to-api/internal/dashboard"
@@ -88,16 +89,29 @@ func main() {
 	if serviceConfig.Debug.Enabled {
 		debugManager = debuglog.NewManager(filepath.Join(filepath.Dir(absoluteConfigPath), "logs"))
 	}
-	application := app.New(providerAdapter, serviceConfig.Server, debugManager)
-	application.SetAPIKey(serviceConfig.Auth.APIKey)
 	if serviceConfig.DevinCloud.BaseURL != "" {
-		application.SetDevinCloud(serviceConfig.DevinCloud)
+		// devin-cloud chat model：把 chat 请求映射成 cloud Devin session。
+		cloudChat, cloudErr := devincloud.New(devincloud.Config{
+			BaseURL:    serviceConfig.DevinCloud.BaseURL,
+			APIKey:     serviceConfig.DevinCloud.APIKey,
+			SnapshotID: serviceConfig.DevinCloud.SnapshotID,
+			Workspace:  serviceConfig.Devin.Workspace,
+		})
+		if cloudErr != nil {
+			log.Fatal(cloudErr)
+		}
+		providerAdapter = &adapter.Mux{Primary: providerAdapter, Alt: cloudChat, Route: devincloud.IsCloudModel}
 		keySource := "client bearer"
 		if serviceConfig.DevinCloud.APIKey != "" {
 			keySource = "DEVIN_API_KEY"
 		}
-		log.Printf("devin cloud sessions passthrough: %s (auth=%s, snapshot_default=%q)",
-			serviceConfig.DevinCloud.BaseURL, keySource, serviceConfig.DevinCloud.SnapshotID)
+		log.Printf("devin cloud sessions: %s (passthrough + chat model %q, auth=%s, snapshot_default=%q)",
+			serviceConfig.DevinCloud.BaseURL, devincloud.CloudModel, keySource, serviceConfig.DevinCloud.SnapshotID)
+	}
+	application := app.New(providerAdapter, serviceConfig.Server, debugManager)
+	application.SetAPIKey(serviceConfig.Auth.APIKey)
+	if serviceConfig.DevinCloud.BaseURL != "" {
+		application.SetDevinCloud(serviceConfig.DevinCloud)
 	}
 	application.SetAuthStatus(func() (bool, string) { return configured.AuthStatus() })
 	application.SetDashboard(dashboard.New(serviceConfig.Dashboard.Password, serviceConfig.Devin.BaseURL, devinConfig.TokenProvider(), serviceConfig.Devin.Proxy, serviceConfig.Devin.ForceHTTP1 != nil && *serviceConfig.Devin.ForceHTTP1))

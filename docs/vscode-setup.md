@@ -93,9 +93,20 @@ Mix trong một provider (mỗi model có `apiType` + `url` riêng):
 "models": [
     { "id": "swe-2-max",            "name": "Devin (chat)",      "url": "http://<IP>:8080/v1/chat/completions", "apiType": "chat-completions", "toolCalling": true, "vision": true },
     { "id": "claude-opus-5-5-max",  "name": "Devin (messages)",  "url": "http://<IP>:8080/v1/messages",         "apiType": "messages",         "toolCalling": true, "vision": true },
-    { "id": "adaptive",             "name": "Devin (responses)", "url": "http://<IP>:8080/v1/responses",        "apiType": "responses",        "toolCalling": true, "vision": true }
+    { "id": "adaptive",             "name": "Devin (responses)", "url": "http://<IP>:8080/v1/responses",        "apiType": "responses",        "toolCalling": true, "vision": true },
+    { "id": "devin-cloud",          "name": "Devin Cloud",       "url": "http://<IP>:8080/v1/chat/completions", "apiType": "chat-completions", "toolCalling": false, "vision": false }
 ]
 ```
+
+### Model `devin-cloud` — cloud Devin session qua chat
+
+Khi proxy có `DEVIN_API_KEY`/`devin_cloud` config, model id `devin-cloud` được
+route sang **api.devin.ai sessions** thay vì devin CLI: mỗi VS Code chat = một
+cloud Devin session (turn đầu `POST /v1/sessions`, turn sau `/message`, proxy
+poll status và trả kết quả). Turn cloud chạy **vài phút** — progress hiện ở
+thinking stream. Override snapshot per-request bằng id
+`devin-cloud@snapshot-xxx`. Lưu ý cloud session tốn ACU và chạy tự chủ — dùng
+có chủ đích, không phải chat thường.
 
 ## 4. `apiKey` — hai cách
 
