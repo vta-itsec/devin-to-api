@@ -1,0 +1,7 @@
+# Default in-image config. Environment variables (DEVIN_SESSION_TOKEN,
+# DEVIN_CREDENTIALS_FILE, DEVIN_MODEL, PROXY_API_KEY, ...) override these values;
+# mount your own file over /etc/devin-to-api/config.yaml to change anything else.
+server:
+  listen: ":8080"
+devin:
+  model: "adaptive"
