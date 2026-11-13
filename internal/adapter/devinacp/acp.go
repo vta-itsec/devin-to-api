@@ -102,45 +102,91 @@ func (a *Adapter) Stream(ctx context.Context, request llm.RequestMessages) (llm.
 	if model == "" {
 		model = a.config.Model
 	}
-	chain := userChainOf(request.Messages)
+	stream := newEventStream(model)
+	go a.drive(ctx, stream, request, model)
+	return stream, nil
+}
+
+// drive 在锁保护下完成路由决策并执行一轮。
+// match → 会话锁 → 重匹配的循环防止并发同链请求重复 prompt：
+// 第一个请求持锁注册完成后，第二个重匹配会看到新的 LastChain → 幂等重放。
+func (a *Adapter) drive(ctx context.Context, stream *eventStream, request llm.RequestMessages, model string) {
+	messages := request.Messages
+	chain := userChainOf(messages)
 	conversationID := strings.TrimSpace(request.ConversationID)
-	match := a.store.match(request.Messages, chain, conversationID)
+	incoming := strings.Join(chain, ",")
 
-	// 幂等：客户端重发完全相同的链 → 回放缓存回复。
-	if match.replay {
-		return replayStream(model, match.session.LastReply), nil
-	}
-	newMessages := tailAfter(request.Messages, match.consumed)
-	// 显式 conversation_id 的会话允许客户端只发新轮次：前缀匹配为空时，
-	// 兜底发送最后一条用户消息（devin 会话自己保有上下文）。
-	if len(newMessages) == 0 && match.session != nil {
-		newMessages = lastUserMessages(request.Messages)
-	}
-	prompt, err := buildPrompt(request.SystemPrompt, newMessages, match.consumed == 0)
-	if err != nil {
-		return nil, err
-	}
-
+	var match matchResult
 	var lock *sync.Mutex
-	if match.session != nil {
+	for {
+		match = a.store.match(messages, chain, conversationID)
+		if match.replay || match.session == nil {
+			break
+		}
 		lock = a.store.lock(match.session.ID)
 		lock.Lock()
+		// 持锁后再匹配一次：等待期间另一并发请求可能已完成本轮。
+		recheck := a.store.match(messages, chain, conversationID)
+		if recheck.replay || recheck.session == nil || recheck.session.ID == match.session.ID {
+			match = recheck
+			break
+		}
+		lock.Unlock()
+	}
+	if lock != nil {
+		defer lock.Unlock()
 	}
 
-	stream := newEventStream(model)
-	go func() {
-		if lock != nil {
-			defer lock.Unlock()
+	if match.replay {
+		stream.pushText(match.session.LastReply)
+		stream.close()
+		return
+	}
+
+	var newMessages []llm.Message
+	switch {
+	case match.session != nil && match.afterAssistant:
+		// 历史被改写（压缩/截断）或客户端不重放：回声之后即新轮次。
+		newMessages = tailFromLastAssistant(messages)
+	default:
+		newMessages = tailAfter(messages, match.consumed)
+	}
+	if len(newMessages) == 0 {
+		// 没有新内容可发：incoming 是会话链的真前缀（客户端回滚）或
+		// 回声重复 → 回放客户端自带的最后一条助手回声；没有回声才兜底
+		// 发最后一条用户消息。
+		if echo := lastAssistantText(messages); echo != "" {
+			stream.pushText(echo)
+			stream.close()
+			return
 		}
-		a.runTurn(ctx, stream, match.session, model, prompt, chain, conversationID, request.Messages)
-	}()
-	return stream, nil
+		newMessages = lastUserMessages(messages)
+	}
+	prompt, err := buildPrompt(request.SystemPrompt, newMessages, match.session == nil)
+	if err != nil {
+		stream.fail(err)
+		return
+	}
+
+	a.runTurn(ctx, stream, match.session, model, prompt,
+		effectiveChain(match.session, chain, conversationID, match), incoming, conversationID, messages)
+}
+
+// lastAssistantText 返回最后一条助手消息的可见文本（回声回放用）。
+func lastAssistantText(messages []llm.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if m, ok := messages[i].(llm.AssistantMessage); ok {
+			return flatten(m.Content)
+		}
+	}
+	return ""
 }
 
 // runTurn 执行一轮：spawn → 会话 → prompt → 事件流 → 注册链。
 // existing 为 nil 时先试 session/list 收养（state 文件丢失后按首条
 // prompt 的 title 找回 devin 会话），收不到才 session/new。
-func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *session, model string, prompt []map[string]any, chain []string, conversationID string, messages []llm.Message) {
+// chain 是规范化用户链，incoming 是本次请求原始链（幂等重放依据）。
+func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *session, model string, prompt []map[string]any, chain []string, incoming, conversationID string, messages []llm.Message) {
 	proc, err := spawnAcp(ctx, a.config.Bin, model, a.config.WorkDir)
 	if err != nil {
 		stream.fail(err)
@@ -268,7 +314,7 @@ func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *se
 			reply.WriteString(tag)
 			stream.pushText(tag)
 			replyHash := messageHash(llm.AssistantMessage{Content: []llm.Content{llm.TextContent{Text: reply.String()}}})
-			a.store.register(&session{ID: sessionID}, model, conversationID, chain, replyHash, reply.String())
+			a.store.register(&session{ID: sessionID}, model, conversationID, chain, incoming, replyHash, reply.String())
 			stream.close()
 			return
 		case <-ctx.Done():

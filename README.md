@@ -51,9 +51,24 @@ chain because clients may reformat them (thinking blocks, reordering).
   (`<!--d2a:<session>-->`). Clients that echo it back verbatim (VS Code does)
   get *deterministic* session routing — two chats with identical openings,
   identical replies, or interleaved turns always land on their own session.
+  Tags are only read from *assistant* messages — a tag quoted inside a user
+  message can never hijack a session.
+- **Client-side compaction / truncation**: when the client rewrites old
+  history (summarized first message, dropped turns), the user-chain diverges
+  at position 0. If an echoed reply still carries the session tag, the same
+  `devin` session is resumed — its real transcript was never compacted — and
+  only the turns after the last echoed reply are prompted. Without a tag the
+  divergence is ambiguous (compaction vs. edited first message look alike),
+  so the safe fork path applies: new session + transcript seed.
 - **Reply fingerprints**: even without the tag, the proxy matches your last
   assistant message against stored reply hashes to disambiguate identical
   openings; ties resolve to the most recently active session.
+- **Devin-side compaction** is transparent: `devin` summarizes long sessions
+  internally (marked via `summarized_from` in `cli/sessions.db`), the session
+  id never changes, and `session/load` keeps working — routing is unaffected.
+- **Concurrency**: turns of the same conversation are serialized per session;
+  a duplicate request that arrives while its twin is in flight waits, then
+  replays the completed reply instead of double-prompting.
 - **`conversation_id`**: clients may send `conversation_id` (chat),
   `metadata.conversation_id` (messages), or `conversation.id`/`conversation`
   (responses) for an explicit 1:1 session binding — no history replay needed,

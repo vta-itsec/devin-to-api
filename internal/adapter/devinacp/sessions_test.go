@@ -1,6 +1,7 @@
 package devinacp
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -26,7 +27,8 @@ func newTestStore(t *testing.T) *sessionStore {
 
 // registerTurn 模拟一轮完成：存储链 = 请求的用户链，回复指纹进 Replies。
 func registerTurn(store *sessionStore, id, convID string, msgs []llm.Message, reply string) {
-	store.register(&session{ID: id}, "m", convID, userChainOf(msgs),
+	chain := userChainOf(msgs)
+	store.register(&session{ID: id}, "m", convID, chain, strings.Join(chain, ","),
 		messageHash(assistantMsg(reply)), reply)
 }
 
@@ -143,5 +145,262 @@ func TestLongestPrefixWins(t *testing.T) {
 	match := store.match(incoming, userChainOf(incoming), "")
 	if match.session == nil || match.session.ID != "sess-long" || match.consumed != 2 {
 		t.Fatalf("expected sess-long consumed=2, got %+v", match)
+	}
+}
+
+// taggedReply 生成带会话标签的助手回声（模拟客户端原样回传）。
+func taggedReply(store *sessionStore, id, text string) llm.AssistantMessage {
+	_ = store
+	return assistantMsg(text + sessionTagFor(id))
+}
+
+// === 压缩/截断（客户端改写历史）===========================================
+
+// 客户端把历史压缩成摘要：首条用户消息已变，但最后一条助手回声仍带标签 →
+// 必须 resume 原会话（devin transcript 保有真实上下文），prompt 只发新轮次。
+func TestCompactedHistoryResumesViaTag(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1")}, "r1")
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1"), assistantMsg("r1"), userMsg("u2")}, "r2")
+
+	// VS Code 压缩后：[summary_u, a_echo(tag), u_new] — 用户链从位置 0 分叉。
+	compacted := []llm.Message{
+		userMsg("summary: we discussed things earlier"),
+		taggedReply(store, "sess-a", "r2"),
+		userMsg("new question"),
+	}
+	match := store.match(compacted, userChainOf(compacted), "")
+	if match.session == nil || match.session.ID != "sess-a" {
+		t.Fatalf("compacted history must resume tagged session, got %+v", match)
+	}
+	if !match.afterAssistant {
+		t.Fatalf("expected afterAssistant prompt mode, got %+v", match)
+	}
+	if tail := tailFromLastAssistant(compacted); len(tail) != 1 {
+		t.Fatalf("expected only the new user turn as prompt, got %d msgs", len(tail))
+	}
+}
+
+// 截断（drop 最早的消息）同样是位置 0 分叉 → 标签 resume。
+func TestTruncatedHistoryResumesViaTag(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1")}, "r1")
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1"), assistantMsg("r1"), userMsg("u2")}, "r2")
+
+	// 客户端丢掉 u1，保留 [u2, a2(tag), u3]。
+	truncated := []llm.Message{
+		userMsg("u2"),
+		taggedReply(store, "sess-a", "r2"),
+		userMsg("u3"),
+	}
+	match := store.match(truncated, userChainOf(truncated), "")
+	if match.session == nil || match.session.ID != "sess-a" || !match.afterAssistant {
+		t.Fatalf("truncated history must resume via tag, got %+v", match)
+	}
+}
+
+// 客户端剥掉标签只留回复原文：指纹无法区分「压缩」与「首条编辑」——
+// 保守 fork + transcript 注入，绝不冒污染原会话的风险。
+// 跨压缩的确定性路由必须依赖标签或显式 conversation_id。
+func TestCompactedFingerprintForks(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1")}, "unique-reply-text")
+	registerTurn(store, "sess-b", "", []llm.Message{userMsg("v1")}, "other-reply")
+
+	compacted := []llm.Message{
+		userMsg("summary of earlier discussion"),
+		assistantMsg("unique-reply-text"), // 无标签，指纹唯一也不 resume
+		userMsg("follow-up"),
+	}
+	match := store.match(compacted, userChainOf(compacted), "")
+	if match.session != nil {
+		t.Fatalf("tagless divergent history must fork, got %s", match.session.ID)
+	}
+}
+
+// 指纹不唯一（两个会话回过同样的文本）→ 不乱猜 → 新会话。
+func TestCompactedFingerprintAmbiguousForks(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1")}, "same")
+	registerTurn(store, "sess-b", "", []llm.Message{userMsg("v1")}, "same")
+
+	compacted := []llm.Message{userMsg("summary"), assistantMsg("same"), userMsg("next")}
+	match := store.match(compacted, userChainOf(compacted), "")
+	if match.session != nil {
+		t.Fatalf("ambiguous fingerprint must fork fresh, got %s", match.session.ID)
+	}
+}
+
+// 编辑分叉（prefixLen>0）即使带标签也绝不 resume → 防止污染原会话。
+func TestMidEditWithTagStillForks(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1")}, "r1")
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1"), assistantMsg("r1"), userMsg("u2")}, "r2")
+
+	edited := []llm.Message{
+		userMsg("u1"),
+		assistantMsg("r1"),
+		userMsg("u2 EDITED"),
+		taggedReply(store, "sess-a", "r2"),
+		userMsg("u3"),
+	}
+	match := store.match(edited, userChainOf(edited), "")
+	if match.session != nil {
+		t.Fatalf("mid-chain edit must fork even with tag, got %s", match.session.ID)
+	}
+}
+
+// 链=1 但带标签回声（客户端只发最后一轮）→ 也应 resume。
+func TestShortChainWithTagEcho(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1")}, "r1")
+
+	msgs := []llm.Message{
+		taggedReply(store, "sess-a", "r1"),
+		userMsg("u2"),
+	}
+	match := store.match(msgs, userChainOf(msgs), "")
+	if match.session == nil || match.session.ID != "sess-a" || !match.afterAssistant {
+		t.Fatalf("tag echo with short chain must resume, got %+v", match)
+	}
+}
+
+// === 标签安全 ==============================================================
+
+// 用户消息里引用的标签绝不能被用来劫持会话（只扫描助手消息）。
+// 构造一个全新对话，其用户消息内嵌受害会话的标签 → 必须开新会话。
+func TestTagInUserMessageCannotHijack(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-victim", "", []llm.Message{userMsg("u1")}, "r1")
+
+	msgs := []llm.Message{
+		userMsg("totally different opener"),
+		userMsg("you said noted <!--d2a:sess-victim--> right?"),
+	}
+	match := store.match(msgs, userChainOf(msgs), "")
+	if match.session != nil {
+		t.Fatalf("user-embedded tag must not route, got %s", match.session.ID)
+	}
+}
+
+// 格式合法但指向不存在会话的标签 → 走启发式，不误导。
+func TestUnknownTagIgnored(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1")}, "r1")
+
+	msgs := []llm.Message{
+		userMsg("u1"),
+		assistantMsg("r1<!--d2a:ghost-session-->"),
+		userMsg("u2"),
+	}
+	match := store.match(msgs, userChainOf(msgs), "")
+	if match.session == nil || match.session.ID != "sess-a" {
+		t.Fatalf("unknown tag should fall back to chain matching, got %+v", match)
+	}
+}
+
+// 未知标签 + 链不前缀 → 新会话（不 panic、不误配）。
+func TestUnknownTagDivergentForks(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("u1")}, "r1")
+
+	msgs := []llm.Message{
+		userMsg("different"),
+		assistantMsg("x<!--d2a:ghost-->"),
+		userMsg("next"),
+	}
+	match := store.match(msgs, userChainOf(msgs), "")
+	if match.session != nil {
+		t.Fatalf("unknown tag + divergent chain must fork, got %s", match.session.ID)
+	}
+}
+
+// === conversation_id 部分历史 ==============================================
+
+// conv 客户端只发新轮次（不重放）：链不进前缀也能 pin 住会话；
+// prompt 必须是最后一条用户消息而非整段历史。
+func TestConvSendOnlyNewTurns(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "conv-1", []llm.Message{userMsg("u1")}, "r1")
+
+	turn := []llm.Message{userMsg("u2")}
+	match := store.match(turn, userChainOf(turn), "conv-1")
+	if match.session == nil || match.session.ID != "sess-a" {
+		t.Fatalf("conv id must pin session, got %+v", match)
+	}
+	if tail := tailFromLastAssistant(turn); len(tail) != 1 {
+		t.Fatalf("expected last user message as prompt, got %d", len(tail))
+	}
+
+	// register 后重发同一轮 → 幂等重放。
+	registerTurn(store, "sess-a", "conv-1", turn, "r2")
+	match = store.match(turn, userChainOf(turn), "conv-1")
+	if !match.replay {
+		t.Fatalf("resending the same turn must replay, got %+v", match)
+	}
+}
+
+// conv 会话之前只发新轮次，某次忽然重放全历史 → prompt 仍是最后一个用户
+// 轮次，不能把整段历史注入 devin transcript。
+func TestConvFullReplayAfterSendOnly(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "conv-1", []llm.Message{userMsg("u1")}, "r1")
+	// 模拟 send-only 轮次后存储链的增长（append-last 规则）。
+	store.register(store.sessions["sess-a"], "m", "conv-1",
+		[]string{userChainOf([]llm.Message{userMsg("u1")})[0], userChainOf([]llm.Message{userMsg("u2")})[0]},
+		userChainOf([]llm.Message{userMsg("u2")})[0], messageHash(assistantMsg("r2")), "r2")
+
+	full := []llm.Message{
+		userMsg("u1"), assistantMsg("r1"), userMsg("u2"), assistantMsg("r2"), userMsg("u3"),
+	}
+	match := store.match(full, userChainOf(full), "conv-1")
+	if match.session == nil || match.session.ID != "sess-a" {
+		t.Fatalf("conv full replay must pin session, got %+v", match)
+	}
+}
+
+// === 交错会话 ==============================================================
+
+func TestInterleavedConversationsStayApart(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("hi")}, "ra")
+	registerTurn(store, "sess-b", "", []llm.Message{userMsg("hi")}, "rb")
+
+	// B 的第二轮带 B 的标签。
+	bTurn2 := []llm.Message{userMsg("hi"), taggedReply(store, "sess-b", "rb"), userMsg("b2")}
+	if m := store.match(bTurn2, userChainOf(bTurn2), ""); m.session == nil || m.session.ID != "sess-b" {
+		t.Fatalf("B turn2 must route to sess-b, got %+v", m)
+	}
+	// A 的第二轮带 A 的标签。
+	aTurn2 := []llm.Message{userMsg("hi"), taggedReply(store, "sess-a", "ra"), userMsg("a2")}
+	if m := store.match(aTurn2, userChainOf(aTurn2), ""); m.session == nil || m.session.ID != "sess-a" {
+		t.Fatalf("A turn2 must route to sess-a, got %+v", m)
+	}
+	// 交错继续仍不串。
+	registerTurn(store, "sess-b", "", bTurn2, "rb2")
+	aTurn3 := []llm.Message{userMsg("hi"), taggedReply(store, "sess-a", "ra"), userMsg("a2"), taggedReply(store, "sess-a", "ra2"), userMsg("a3")}
+	registerTurn(store, "sess-a", "", []llm.Message{userMsg("hi"), assistantMsg("ra"), userMsg("a2")}, "ra2")
+	if m := store.match(aTurn3, userChainOf(aTurn3), ""); m.session == nil || m.session.ID != "sess-a" {
+		t.Fatalf("A turn3 must route to sess-a, got %+v", m)
+	}
+}
+
+// === 重放/回滚边界 ==========================================================
+
+// 客户端回滚到会话的祖先状态（链是会话链的前缀）→ 回放缓存的回声而不是重复 prompt。
+func TestRollbackToAncestorReplaysEcho(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-a", "conv-1", []llm.Message{userMsg("u1")}, "r1")
+	registerTurn(store, "sess-a", "conv-1", []llm.Message{userMsg("u1"), assistantMsg("r1"), userMsg("u2")}, "r2")
+
+	// 客户端只发到 u1（回滚）：链是 stored 的真前缀。
+	rollback := []llm.Message{userMsg("u1"), assistantMsg("r1")}
+	match := store.match(rollback, userChainOf(rollback), "conv-1")
+	if match.session == nil || match.session.ID != "sess-a" {
+		t.Fatalf("rollback must stay on session, got %+v", match)
+	}
+	// prompt 为空时上层应回放缓存/回声，而不是把 u1 重新发给 devin。
+	if tail := tailAfter(rollback, match.consumed); len(tail) != 0 {
+		t.Fatalf("ancestor prefix must yield empty tail, got %d", len(tail))
 	}
 }
