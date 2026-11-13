@@ -29,11 +29,11 @@ type eventStream struct {
 func newEventStream(model string) *eventStream {
 	s := &eventStream{model: model, notify: make(chan struct{}, 1)}
 	s.partial = llm.AssistantMessage{
-		API:          "acp",
-		Provider:     "devin",
-		Model:        model,
-		StopReason:   llm.StopReasonPending,
-		TimestampMS:  time.Now().UnixMilli(),
+		API:           "acp",
+		Provider:      "devin",
+		Model:         model,
+		StopReason:    llm.StopReasonPending,
+		TimestampMS:   time.Now().UnixMilli(),
 		ResponseModel: model,
 	}
 	return s

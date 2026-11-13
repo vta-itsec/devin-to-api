@@ -12,6 +12,7 @@
 //     会话的指纹，哪个会话优先——开头相同的不同聊天在 turn-2 自动归位。
 //   - turn-1（单条用户消息）永不复用/重放：开头相同的聊天各自独立建会话。
 //   - 显式 conversation_id（客户端字段）直接索引，跳过启发式。
+//
 // 映射持久化到 JSON 文件，proxy 重启后仍可 resume（devin 端会话存在
 // sessions.db 中，由 session/load 恢复完整上下文）；文件丢失时可按
 // devin session 的 title（首条 prompt 文本）从 session/list 收养。
@@ -36,6 +37,9 @@ import (
 type session struct {
 	// ID 是 devin acp 的 sessionId（如 "silly-measure"）。
 	ID string `json:"id"`
+	// Tag 是嵌入回复的零宽指纹别名（如 "s3"）——编码后不可见，
+	// 不像 HTML 注释那样在 VS Code 里显示为文本。
+	Tag string `json:"tag,omitempty"`
 	// Chain 是按序消费过的【用户/工具结果】消息哈希。
 	Chain []string `json:"chain"`
 	// Replies 是本会话产生过的助手回复文本哈希（指纹），
@@ -175,7 +179,7 @@ func tailAfter(messages []llm.Message, consumed int) []llm.Message {
 
 // matchResult 描述一次匹配。
 type matchResult struct {
-	session  *session
+	session *session
 	// consumed 是已消费的非助手消息条数（非下标）。
 	consumed int
 	// replay 为 true 时整条链已消费过 → 直接回放缓存回复。
@@ -192,12 +196,13 @@ type sessionStore struct {
 	ttl      time.Duration
 	sessions map[string]*session
 	byConv   map[string]string // conversation_id → sessionId
+	byTag    map[string]string // 零宽别名 → sessionId
 	// busy 串行化同一会话的轮次（同一对话不应并发 prompt）。
 	busy map[string]*sync.Mutex
 }
 
 func newSessionStore(path string, ttl time.Duration) (*sessionStore, error) {
-	store := &sessionStore{path: path, ttl: ttl, sessions: map[string]*session{}, byConv: map[string]string{}, busy: map[string]*sync.Mutex{}}
+	store := &sessionStore{path: path, ttl: ttl, sessions: map[string]*session{}, byConv: map[string]string{}, byTag: map[string]string{}, busy: map[string]*sync.Mutex{}}
 	if path == "" {
 		return store, nil
 	}
@@ -219,6 +224,9 @@ func newSessionStore(path string, ttl time.Duration) (*sessionStore, error) {
 		store.sessions[s.ID] = s
 		if s.Conversation != "" {
 			store.byConv[s.Conversation] = s.ID
+		}
+		if s.Tag != "" {
+			store.byTag[s.Tag] = s.ID
 		}
 	}
 	return store, nil
@@ -256,7 +264,7 @@ func (store *sessionStore) match(messages []llm.Message, chain []string, convers
 	// 标签锚定：回复中内嵌的 <!--d2a:<sid>--> 被客户端原样回传时，
 	// 直接定位到产生该回复的会话——最精确的匹配。
 	// 必须在链长检查之前：压缩/截断后的短链请求同样依赖标签路由。
-	if sid := lastSessionTag(messages); sid != "" {
+	if sid := store.lastSessionTag(messages); sid != "" {
 		if s := store.sessions[sid]; s != nil {
 			if s.LastChain == joined && s.LastReply != "" {
 				return matchResult{session: s, replay: true}
@@ -342,17 +350,81 @@ func prefixLen(prefix, full []string) int {
 	return n
 }
 
-// sessionTag 是嵌入回复尾部的会话指纹标记（HTML 注释，markdown 渲染不可见）。
+// 会话指纹标记：零宽编码，渲染与纯文本下均不可见。
+// 格式：U+2060 <base4 编码的别名> U+2060。别名用短串（"s1"…）映射到
+// sessionId，避免把整个 sessionId 塞进回复。
+// 旧格式 <!--d2a:<sid>--> 在 VS Code chat 会显示为文本——仅作向后兼容解析。
 const sessionTagPrefix = "<!--d2a:"
 const sessionTagSuffix = "-->"
 
-// sessionTagFor 生成某会话的回复指纹标记。
-func sessionTagFor(sessionID string) string {
-	return "\n\n" + sessionTagPrefix + sessionID + sessionTagSuffix
+const zwSentinel = '\u2060' // U+2060 WORD JOINER：哨兵，不出现在编码字母表
+
+var (
+	zwAlphabet  = []rune{'\u200b', '\u200c', '\u200d', '\ufeff'} // ZWSP, ZWNJ, ZWJ, ZWNBSP
+	zwDecodeMap = map[rune]int{'\u200b': 0, '\u200c': 1, '\u200d': 2, '\ufeff': 3}
+)
+
+// sessionTagFor 生成某会话的回复指纹标记（零宽编码别名）。
+func (store *sessionStore) sessionTagFor(sessionID string) string {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	alias := store.ensureTagLocked(sessionID)
+	return string(zwSentinel) + encodeZW(alias) + string(zwSentinel)
+}
+
+// ensureTagLocked 为会话分配稳定别名（s1, s2, ...）；持久化到 session.Tag。
+// 会话尚未注册时别名也可能已分配过（tagFor 先于 register 被调用），
+// 先按 byTag 反查，保证同一会话拿到同一别名。
+func (store *sessionStore) ensureTagLocked(sessionID string) string {
+	if s := store.sessions[sessionID]; s != nil && s.Tag != "" {
+		return s.Tag
+	}
+	for alias, id := range store.byTag {
+		if id == sessionID {
+			return alias
+		}
+	}
+	for n := 1; ; n++ {
+		alias := fmt.Sprintf("s%d", n)
+		if _, taken := store.byTag[alias]; !taken {
+			if s := store.sessions[sessionID]; s != nil {
+				s.Tag = alias
+			}
+			store.byTag[alias] = sessionID
+			return alias
+		}
+	}
+}
+
+func encodeZW(text string) string {
+	var b strings.Builder
+	for _, c := range []byte(text) {
+		for shift := 6; shift >= 0; shift -= 2 {
+			b.WriteRune(zwAlphabet[(c>>shift)&3])
+		}
+	}
+	return b.String()
+}
+
+func decodeZW(runes []rune) string {
+	if len(runes)%4 != 0 || len(runes) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i := 0; i < len(runes); i += 4 {
+		v := zwDecodeMap[runes[i]]<<6 | zwDecodeMap[runes[i+1]]<<4 | zwDecodeMap[runes[i+2]]<<2 | zwDecodeMap[runes[i+3]]
+		if v < 0x20 || v > 0x7e {
+			return ""
+		}
+		b.WriteByte(byte(v))
+	}
+	return b.String()
 }
 
 // lastSessionTag 从后往前找助手消息中的会话标记；客户端回传原文时即指纹。
-func lastSessionTag(messages []llm.Message) string {
+// 同时解析新零宽格式与旧 HTML 注释格式（老会话的历史回声）。
+// 调用方须持有 store.mu（match 内部调用）。
+func (store *sessionStore) lastSessionTag(messages []llm.Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		m, ok := messages[i].(llm.AssistantMessage)
 		if !ok {
@@ -363,7 +435,7 @@ func lastSessionTag(messages []llm.Message) string {
 			if !ok {
 				continue
 			}
-			if id := extractTag(text.Text); id != "" {
+			if id := store.extractTag(text.Text); id != "" {
 				return id
 			}
 		}
@@ -371,7 +443,41 @@ func lastSessionTag(messages []llm.Message) string {
 	return ""
 }
 
-func extractTag(text string) string {
+// extractTag 返回文本中的会话 ID：优先零宽标记，再旧 HTML 注释。
+func (store *sessionStore) extractTag(text string) string {
+	if id := store.extractZW(text); id != "" {
+		return id
+	}
+	return extractLegacyTag(text)
+}
+
+// extractZW 定位最后一个 U+2060 哨兵，向前取编码字母表 runes，
+// 再前一位须是另一个哨兵；base4 解码得别名后经 byTag 反查会话。
+// 调用方须持有 store.mu。
+func (store *sessionStore) extractZW(text string) string {
+	closing := strings.LastIndex(text, string(zwSentinel))
+	if closing <= 0 {
+		return ""
+	}
+	runes := []rune(text[:closing])
+	i := len(runes)
+	for i > 0 {
+		if _, ok := zwDecodeMap[runes[i-1]]; !ok {
+			break
+		}
+		i--
+	}
+	if i == len(runes) || i == 0 || runes[i-1] != zwSentinel {
+		return ""
+	}
+	alias := decodeZW(runes[i:])
+	if alias == "" {
+		return ""
+	}
+	return store.byTag[alias]
+}
+
+func extractLegacyTag(text string) string {
 	start := strings.LastIndex(text, sessionTagPrefix)
 	if start < 0 {
 		return ""
@@ -418,14 +524,23 @@ func (store *sessionStore) register(s *session, model, conversationID string, ch
 	if s.Conversation != "" {
 		store.byConv[s.Conversation] = s.ID
 	}
-	// 收养/重建会话时合并旧指纹，不丢历史回复锚点。
+	// 收养/重建会话时合并旧指纹与别名，不丢历史回复锚点。
 	if old := store.sessions[s.ID]; old != nil && old != s {
 		for _, r := range old.Replies {
 			if !s.hasReply(r) {
 				s.Replies = append(s.Replies, r)
 			}
 		}
+		if s.Tag == "" {
+			s.Tag = old.Tag
+		}
 	}
+	// tagFor 先于 register 分配过别名但对象上尚未回填（新会话路径）；
+	// 此处兜底：没有别名就当场分配，保证落盘的 Tag 字段始终有值。
+	if s.Tag == "" {
+		s.Tag = store.ensureTagLocked(s.ID)
+	}
+	store.byTag[s.Tag] = s.ID
 	if replyHash != "" && !s.hasReply(replyHash) {
 		s.Replies = append(s.Replies, replyHash)
 	}
@@ -462,6 +577,9 @@ func (store *sessionStore) pruneLocked() {
 			delete(store.sessions, id)
 			if s.Conversation != "" {
 				delete(store.byConv, s.Conversation)
+			}
+			if s.Tag != "" && store.byTag[s.Tag] == id {
+				delete(store.byTag, s.Tag)
 			}
 		}
 	}

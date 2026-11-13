@@ -47,12 +47,15 @@ chain because clients may reformat them (thinking blocks, reordering).
 - **New chat / edited history / fork** → the prefix diverges → a fresh `devin`
   session is created and the history is injected as a transcript prompt —
   the original session's transcript is never polluted.
-- **Session tags**: every reply carries an invisible HTML-comment fingerprint
-  (`<!--d2a:<session>-->`). Clients that echo it back verbatim (VS Code does)
-  get *deterministic* session routing — two chats with identical openings,
-  identical replies, or interleaved turns always land on their own session.
-  Tags are only read from *assistant* messages — a tag quoted inside a user
-  message can never hijack a session.
+- **Session tags**: every reply carries an invisible fingerprint — a short
+  alias base4-encoded into zero-width characters (`U+2060<zw>U+2060`), so it
+  is invisible in rendered chat *and* raw text. Clients that echo it back
+  verbatim (VS Code does) get *deterministic* session routing — two chats
+  with identical openings, identical replies, or interleaved turns always
+  land on their own session. Tags are only read from *assistant* messages —
+  a tag quoted inside a user message can never hijack a session. The older
+  `<!--d2a:<session>-->` HTML-comment format is still recognized in
+  pre-upgrade histories.
 - **Client-side compaction / truncation**: when the client rewrites old
   history (summarized first message, dropped turns), the user-chain diverges
   at position 0. If an echoed reply still carries the session tag, the same

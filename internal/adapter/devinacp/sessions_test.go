@@ -150,8 +150,60 @@ func TestLongestPrefixWins(t *testing.T) {
 
 // taggedReply 生成带会话标签的助手回声（模拟客户端原样回传）。
 func taggedReply(store *sessionStore, id, text string) llm.AssistantMessage {
-	_ = store
-	return assistantMsg(text + sessionTagFor(id))
+	return assistantMsg(text + "\n\n" + store.sessionTagFor(id))
+}
+
+// === 零宽标签编解码 =======================================================
+
+func TestZWTagRoundTrip(t *testing.T) {
+	store := newTestStore(t)
+	tag := store.sessionTagFor("sess-x")
+	if strings.Contains(tag, "d2a") || strings.Contains(tag, "sess-x") {
+		t.Fatalf("zw tag must not contain readable text, got %q", tag)
+	}
+	// 标签应完全由哨兵+编码字母表构成 → 渲染后不可见。
+	for _, r := range tag {
+		if _, ok := zwDecodeMap[r]; !ok && r != zwSentinel {
+			t.Fatalf("tag contains visible char %q", r)
+		}
+	}
+	if got := store.extractZW("reply text" + tag); got != "sess-x" {
+		t.Fatalf("extractZW round-trip failed, got %q", got)
+	}
+	// 再次生成同一会话 → 别名稳定。
+	if tag2 := store.sessionTagFor("sess-x"); tag2 != tag {
+		t.Fatalf("tag alias must be stable, got %q vs %q", tag, tag2)
+	}
+}
+
+func TestZWTagLegacyCommentStillParsed(t *testing.T) {
+	store := newTestStore(t)
+	registerTurn(store, "sess-old", "", []llm.Message{userMsg("u1")}, "r1")
+
+	// 旧格式 HTML 注释回声仍须能定位会话。
+	msgs := []llm.Message{
+		userMsg("u1"),
+		assistantMsg("r1\n\n<!--d2a:sess-old-->"),
+		userMsg("u2"),
+	}
+	match := store.match(msgs, userChainOf(msgs), "")
+	if match.session == nil || match.session.ID != "sess-old" {
+		t.Fatalf("legacy comment tag must still route, got %+v", match)
+	}
+}
+
+func TestExtractZWRejectsGarbage(t *testing.T) {
+	store := newTestStore(t)
+	if id := store.extractZW("normal text ⁠no alphabet here⁠ end"); id != "" {
+		t.Fatalf("must reject non-encoded sentinels, got %q", id)
+	}
+	if id := store.extractZW("plain reply with no tag at all"); id != "" {
+		t.Fatalf("must not extract from tagless text, got %q", id)
+	}
+	// 哨兵包裹但 body 是乱码/无别名 → "" 。
+	if id := store.extractZW("x" + string(zwSentinel) + encodeZW("zzz999") + string(zwSentinel)); id != "" {
+		t.Fatalf("unknown alias must not resolve, got %q", id)
+	}
 }
 
 // === 压缩/截断（客户端改写历史）===========================================

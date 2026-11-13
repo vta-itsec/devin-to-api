@@ -319,8 +319,8 @@ func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *se
 				}
 			}
 		flushed:
-			// 回复尾部嵌入会话标签：客户端原样回传后，下一轮可直接定位会话。
-			tag := sessionTagFor(sessionID)
+			// 回复尾部嵌入零宽会话标签：客户端原样回传后，下一轮可直接定位会话。
+			tag := "\n\n" + a.store.sessionTagFor(sessionID)
 			reply.WriteString(tag)
 			stream.pushText(tag)
 			replyHash := messageHash(llm.AssistantMessage{Content: []llm.Content{llm.TextContent{Text: reply.String()}}})
@@ -344,6 +344,7 @@ func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *se
 //   - 池里有该会话的进程 → 直接复用（免 initialize/load，最快路径）。
 //   - 否则 spawn 新进程：initialize → session/load(existing) →
 //     收养(session/list) → session/new → set_mode。
+//
 // existing 为 nil 且收养失败时新建会话。prompt 指针在收养路径被改写为
 // 「最后一条用户消息」。失败时返回 nil 并已 stream.fail。
 func (a *Adapter) attach(ctx context.Context, stream *eventStream, existing *session, model string, messages []llm.Message, prompt *[]map[string]any) (*attachedProc, string) {
