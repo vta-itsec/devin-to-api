@@ -40,6 +40,10 @@ type RequestMessages struct {
 	Messages []Message
 	// Tools 是本次请求允许模型调用的工具定义。
 	Tools []ToolDefinition
+	// ConversationID 是客户端显式声明的会话标识（conversation_id /
+	// metadata.conversation_id / conversation.id 等）；会话后端（acp）优先用它
+	// 定位 devin 会话，缺省时退回消息链前缀匹配。
+	ConversationID string
 }
 
 // Message 是用户、助手或工具结果消息的统一接口。

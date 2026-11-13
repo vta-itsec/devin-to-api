@@ -25,6 +25,8 @@ type Request struct {
 	TopP          *float64        `json:"top_p,omitempty"`
 	TopK          *int            `json:"top_k,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
+	// Metadata 可携带 conversation_id（acp 后端用它定位 devin 会话）。
+	Metadata      json.RawMessage `json:"metadata,omitempty"`
 }
 
 // Message 是 Anthropic 消息条目。
@@ -81,7 +83,11 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 		return AdaptedRequest{}, errors.New("anthropic request messages are required")
 	}
 
-	context := llm.RequestMessages{Model: request.Model}
+	var meta struct {
+		ConversationID string `json:"conversation_id"`
+	}
+	_ = json.Unmarshal(request.Metadata, &meta)
+	context := llm.RequestMessages{Model: request.Model, ConversationID: meta.ConversationID}
 	if len(bytes.TrimSpace(request.System)) > 0 && !bytes.Equal(bytes.TrimSpace(request.System), []byte("null")) {
 		if err := appendSystem(&context, request.System); err != nil {
 			return AdaptedRequest{}, err

@@ -102,14 +102,20 @@ func (a *Adapter) Stream(ctx context.Context, request llm.RequestMessages) (llm.
 	if model == "" {
 		model = a.config.Model
 	}
-	chain := chainOf(request.Messages)
-	match := a.store.match(chain)
+	chain := userChainOf(request.Messages)
+	conversationID := strings.TrimSpace(request.ConversationID)
+	match := a.store.match(request.Messages, chain, conversationID)
 
 	// 幂等：客户端重发完全相同的链 → 回放缓存回复。
-	if match.consumed == len(chain) && match.session != nil && match.session.LastReply != "" {
+	if match.replay {
 		return replayStream(model, match.session.LastReply), nil
 	}
-	newMessages := request.Messages[match.consumed:]
+	newMessages := tailAfter(request.Messages, match.consumed)
+	// 显式 conversation_id 的会话允许客户端只发新轮次：前缀匹配为空时，
+	// 兜底发送最后一条用户消息（devin 会话自己保有上下文）。
+	if len(newMessages) == 0 && match.session != nil {
+		newMessages = lastUserMessages(request.Messages)
+	}
 	prompt, err := buildPrompt(request.SystemPrompt, newMessages, match.consumed == 0)
 	if err != nil {
 		return nil, err
@@ -126,13 +132,15 @@ func (a *Adapter) Stream(ctx context.Context, request llm.RequestMessages) (llm.
 		if lock != nil {
 			defer lock.Unlock()
 		}
-		a.runTurn(ctx, stream, match.session, model, prompt, chain)
+		a.runTurn(ctx, stream, match.session, model, prompt, chain, conversationID, request.Messages)
 	}()
 	return stream, nil
 }
 
 // runTurn 执行一轮：spawn → 会话 → prompt → 事件流 → 注册链。
-func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *session, model string, prompt []map[string]any, chain []string) {
+// existing 为 nil 时先试 session/list 收养（state 文件丢失后按首条
+// prompt 的 title 找回 devin 会话），收不到才 session/new。
+func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *session, model string, prompt []map[string]any, chain []string, conversationID string, messages []llm.Message) {
 	proc, err := spawnAcp(ctx, a.config.Bin, model, a.config.WorkDir)
 	if err != nil {
 		stream.fail(err)
@@ -170,6 +178,18 @@ func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *se
 		drainUpdates(proc)
 		if loadErr == nil {
 			sessionID = existing.ID
+		}
+	}
+	if sessionID == "" && isContinuation(chain, messages) {
+		// 收养：state 丢失/换机时，按首条用户消息文本找回 devin 会话。
+		// 只对「延续中的对话」收养——裸 turn-1 与现存会话开场相同属于
+		// 新聊天，收养会把别人的 session 抢过来污染上下文。
+		// 收养的会话 transcript 已含全部历史 → prompt 只发最后一条用户消息。
+		if adopted := a.adoptByTitle(setupCtx, proc, cwd, firstUserText(messages)); adopted != "" {
+			sessionID = adopted
+			if lastUser := lastUserPrompt(messages); len(lastUser) > 0 {
+				prompt = lastUser
+			}
 		}
 	}
 	if sessionID == "" {
@@ -243,12 +263,12 @@ func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *se
 				}
 			}
 		flushed:
-			// Chain = 请求链 + 我们生成的助手回复哈希：下轮客户端回传的
-			// [.., u_n, a_n, u_{n+1}] 才能与存储链形成完整前缀，从而只把
-			// u_{n+1} 作为新 prompt 发给 devin（devin 会话自己保有 a_n 上下文）。
-			fullChain := append(append([]string(nil), chain...),
-				messageHash(llm.AssistantMessage{Content: []llm.Content{llm.TextContent{Text: reply.String()}}}))
-			a.store.register(&session{ID: sessionID}, model, fullChain, reply.String())
+			// 回复尾部嵌入会话标签：客户端原样回传后，下一轮可直接定位会话。
+			tag := sessionTagFor(sessionID)
+			reply.WriteString(tag)
+			stream.pushText(tag)
+			replyHash := messageHash(llm.AssistantMessage{Content: []llm.Content{llm.TextContent{Text: reply.String()}}})
+			a.store.register(&session{ID: sessionID}, model, conversationID, chain, replyHash, reply.String())
 			stream.close()
 			return
 		case <-ctx.Done():
@@ -259,6 +279,112 @@ func (a *Adapter) runTurn(ctx context.Context, stream *eventStream, existing *se
 			return
 		}
 	}
+}
+
+// isContinuation 报告请求是否是一次「对话延续」（≥2 条用户消息或带助手
+// 回声）。只有延续请求才允许收养 devin 会话。
+func isContinuation(chain []string, messages []llm.Message) bool {
+	if len(chain) > 1 {
+		return true
+	}
+	for _, m := range messages {
+		if _, ok := m.(llm.AssistantMessage); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// lastUserMessages 返回只含最后一条用户消息的切片（显式会话兜底用）。
+func lastUserMessages(messages []llm.Message) []llm.Message {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if _, ok := messages[i].(llm.UserMessage); ok {
+			return messages[i : i+1]
+		}
+	}
+	return nil
+}
+
+// lastUserPrompt 提取最后一条用户消息为 ACP prompt blocks（收养会话用）。
+func lastUserPrompt(messages []llm.Message) []map[string]any {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if user, ok := messages[i].(llm.UserMessage); ok {
+			var blocks []map[string]any
+			for _, block := range user.Content {
+				switch block := block.(type) {
+				case llm.TextContent:
+					blocks = append(blocks, map[string]any{"type": "text", "text": block.Text})
+				case llm.ImageContent:
+					data := block.Data
+					if _, encoded, ok := strings.Cut(data, ","); ok && strings.HasPrefix(data, "data:") {
+						data = encoded
+					}
+					mime := block.MIMEType
+					if mime == "" {
+						mime = "image/png"
+					}
+					blocks = append(blocks, map[string]any{"type": "image", "data": data, "mimeType": mime})
+				}
+			}
+			return blocks
+		}
+	}
+	return nil
+}
+
+// adoptByTitle 在 state 映射缺失时通过 session/list 的 title（devin 取的
+// 首条 prompt 摘要）找回旧 devin 会话并 session/load。title 可能被截断，
+// 用双向前缀比较；多条命中时不收养（避免误认）。失败返回 ""。
+func (a *Adapter) adoptByTitle(ctx context.Context, proc *rpcProcess, cwd, firstText string) string {
+	firstText = strings.TrimSpace(firstText)
+	if len(firstText) < 8 {
+		return ""
+	}
+	result, err := proc.call(ctx, "session/list", map[string]any{})
+	if err != nil {
+		return ""
+	}
+	var list struct {
+		Sessions []struct {
+			SessionID string `json:"sessionId"`
+			Cwd       string `json:"cwd"`
+			Title     string `json:"title"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(result, &list); err != nil {
+		return ""
+	}
+	var hit string
+	for _, s := range list.Sessions {
+		if s.Cwd != cwd {
+			continue
+		}
+		title := strings.TrimSpace(s.Title)
+		if title == "" {
+			continue
+		}
+		// devin title 通常是 prompt 开头（可能被截断/加省略号）。
+		if !strings.HasPrefix(firstText, title) && !strings.HasPrefix(title, firstText) {
+			continue
+		}
+		if hit != "" {
+			return "" // 多个候选 → 不收养，宁可新建。
+		}
+		hit = s.SessionID
+	}
+	if hit == "" {
+		return ""
+	}
+	proc.loading.Store(true)
+	_, err = proc.call(ctx, "session/load", map[string]any{
+		"sessionId": hit, "cwd": cwd, "mcpServers": []any{},
+	})
+	proc.loading.Store(false)
+	drainUpdates(proc)
+	if err != nil {
+		return ""
+	}
+	return hit
 }
 
 func drainUpdates(proc *rpcProcess) {

@@ -26,6 +26,21 @@ type Request struct {
 	TopP                *float64        `json:"top_p,omitempty"`
 	Stop                json.RawMessage `json:"stop,omitempty"`
 	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
+	// ConversationID 是可选的会话标识（acp 后端用它定位 devin 会话）。
+	ConversationID      string          `json:"conversation_id,omitempty"`
+	Metadata            json.RawMessage `json:"metadata,omitempty"`
+}
+
+// conversationIDOf 取顶层 conversation_id，缺省回退 metadata.conversation_id。
+func conversationIDOf(explicit string, metadata json.RawMessage) string {
+	if explicit != "" {
+		return explicit
+	}
+	var meta struct {
+		ConversationID string `json:"conversation_id"`
+	}
+	_ = json.Unmarshal(metadata, &meta)
+	return meta.ConversationID
 }
 
 // Message 是 Chat Completions 消息条目。
@@ -96,7 +111,7 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 		return AdaptedRequest{}, errors.New("chat request messages are required")
 	}
 
-	context := llm.RequestMessages{Model: request.Model}
+	context := llm.RequestMessages{Model: request.Model, ConversationID: conversationIDOf(request.ConversationID, request.Metadata)}
 	if err := appendMessages(&context, request.Messages); err != nil {
 		return AdaptedRequest{}, err
 	}

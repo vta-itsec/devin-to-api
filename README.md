@@ -37,17 +37,33 @@ The proxy can drive Devin two ways — pick with `devin.backend` /
 | Tools | Client-declared tools forwarded to the model | Devin's own tools (fs/exec) run inside `workspace` — it can read your code to answer |
 | Needs | `credentials.toml` token | `credentials.toml` token **+ `devin` binary** |
 
-**How conversations map to sessions (acp):** the proxy hashes the message
-history chain and matches the longest prefix against registered sessions.
-A VS Code *new chat* has no matching prefix → fresh `devin` session; follow-up
-turns in that chat extend the same chain → same `devin` session via
-`session/load`. The map persists in
-`<workspace>/.devin-to-api-sessions.json`, so a proxy restart does not lose
-conversations, and the underlying Devin sessions also show up in
-`devin list`. Two chats that literally start with the identical first message
-are ambiguous — the proxy starts a fresh session rather than mixing contexts.
-An identical repeated request replays the cached reply instead of spending a
-new turn.
+**How conversations map to sessions (acp):** the proxy hashes each *user*
+message of the incoming history into a chain and matches the longest strict
+prefix against registered sessions — assistant messages are excluded from the
+chain because clients may reformat them (thinking blocks, reordering).
+
+- **Same chat, next turn** → prefix extends → `session/load` resumes the same
+  `devin` session; only the new turn is prompted.
+- **New chat / edited history / fork** → the prefix diverges → a fresh `devin`
+  session is created and the history is injected as a transcript prompt —
+  the original session's transcript is never polluted.
+- **Session tags**: every reply carries an invisible HTML-comment fingerprint
+  (`<!--d2a:<session>-->`). Clients that echo it back verbatim (VS Code does)
+  get *deterministic* session routing — two chats with identical openings,
+  identical replies, or interleaved turns always land on their own session.
+- **Reply fingerprints**: even without the tag, the proxy matches your last
+  assistant message against stored reply hashes to disambiguate identical
+  openings; ties resolve to the most recently active session.
+- **`conversation_id`**: clients may send `conversation_id` (chat),
+  `metadata.conversation_id` (messages), or `conversation.id`/`conversation`
+  (responses) for an explicit 1:1 session binding — no history replay needed,
+  each request may carry only the new turn.
+- **Replay**: resending an already-completed chain returns the cached reply.
+- **Map persistence**: `<workspace>/.devin-to-api-sessions.json` survives
+  restarts; if it is lost, the proxy recovers by matching the first user
+  message against `session/list` titles (only when exactly one session
+  matches) — otherwise it falls back to a transcript-seeded new session.
+- All Devin sessions also appear in `devin list` on the host.
 
 **ACP workspace:** `devin.workspace` (`DEVIN_WORKSPACE`, Docker default
 `/home/devin/workspace`) is the session cwd *and* the only directory Devin's

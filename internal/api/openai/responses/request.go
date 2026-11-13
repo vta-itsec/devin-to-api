@@ -32,6 +32,33 @@ type Request struct {
 	Temperature *float64 `json:"temperature,omitempty"`
 	// PreviousResponseID 是上游 Responses 会话关联标识。
 	PreviousResponseID string `json:"previous_response_id,omitempty"`
+	// Conversation 是 Responses conversation 对象（{"id": "conv_..."}）或字符串；
+	// Metadata.conversation_id 亦可 —— acp 后端用它定位 devin 会话。
+	Conversation json.RawMessage `json:"conversation,omitempty"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
+}
+
+// conversationID 依次取 conversation.id / conversation 字符串 /
+// metadata.conversation_id 作为会话标识。previous_response_id 每轮都变，
+// 不能充当稳定的会话 key。
+func conversationID(conversation, metadata json.RawMessage) string {
+	var raw string
+	if json.Unmarshal(conversation, &raw) == nil && raw != "" {
+		return raw
+	}
+	var obj struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(conversation, &obj) == nil && obj.ID != "" {
+		return obj.ID
+	}
+	var meta struct {
+		ConversationID string `json:"conversation_id"`
+	}
+	if json.Unmarshal(metadata, &meta) == nil {
+		return meta.ConversationID
+	}
+	return ""
 }
 
 // Tool 是 OpenAI Responses function 工具定义。
@@ -77,7 +104,7 @@ func DecodeRequest(data []byte) (AdaptedRequest, error) {
 		return AdaptedRequest{}, errors.New("responses request model is required")
 	}
 
-	context := llm.RequestMessages{Model: request.Model, SystemPrompt: request.Instructions}
+	context := llm.RequestMessages{Model: request.Model, SystemPrompt: request.Instructions, ConversationID: conversationID(request.Conversation, request.Metadata)}
 	if err := appendInputMessages(&context, request.Input); err != nil {
 		return AdaptedRequest{}, err
 	}

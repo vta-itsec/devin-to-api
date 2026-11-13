@@ -1,9 +1,20 @@
 // 本文件维护「客户端对话」到「Devin CLI 会话」的映射。
 //
-// VS Code 等客户端每次请求都重放完整消息历史，proxy 用逐消息 chain-hash
-// 最长前缀匹配找出该对话已绑定的 devin acp 会话；匹配不到就开新会话。
+// VS Code 等客户端每次请求都重放完整消息历史，proxy 用消息链匹配找出
+// 该对话绑定的 devin acp 会话。匹配规则（v2）：
+//   - 匹配链只含【用户/工具结果】消息的哈希：助手消息是 proxy 自己产出的
+//     回声，客户端可能重排 content block 或附加 thinking，不可作为链数据。
+//     devin 端 transcript 自己保有它说过的话。
+//   - 会话只能「向后延伸」：incoming 的用户链必须以会话已存链为前缀才允许
+//     resume；中途编辑/分叉 → 新会话 + transcript 上下文注入，保证
+//     devin 端 transcript 永不被污染。
+//   - 助手回复指纹（Replies）用于锚定：incoming 最后一条助手消息命中哪个
+//     会话的指纹，哪个会话优先——开头相同的不同聊天在 turn-2 自动归位。
+//   - turn-1（单条用户消息）永不复用/重放：开头相同的聊天各自独立建会话。
+//   - 显式 conversation_id（客户端字段）直接索引，跳过启发式。
 // 映射持久化到 JSON 文件，proxy 重启后仍可 resume（devin 端会话存在
-// sessions.db 中，由 `session/load` 恢复完整上下文）。
+// sessions.db 中，由 session/load 恢复完整上下文）；文件丢失时可按
+// devin session 的 title（首条 prompt 文本）从 session/list 收养。
 package devinacp
 
 import (
@@ -21,25 +32,38 @@ import (
 	"github.com/vta-itsec/devin-to-api/internal/llm"
 )
 
-// session 记录一次对话与 devin session 的绑定及其已消费的消息链。
+// session 记录一次对话与 devin session 的绑定及其已消费的用户消息链。
 type session struct {
 	// ID 是 devin acp 的 sessionId（如 "silly-measure"）。
 	ID string `json:"id"`
-	// Chain 是按序消费过的消息哈希：用户消息 + 我们生成的助手回复。
+	// Chain 是按序消费过的【用户/工具结果】消息哈希。
 	Chain []string `json:"chain"`
+	// Replies 是本会话产生过的助手回复文本哈希（指纹），
+	// 用于开头相同的多会话消歧。
+	Replies []string `json:"replies,omitempty"`
+	// Conversation 是客户端显式传入的会话标识（conversation_id 等）。
+	Conversation string `json:"conversation,omitempty"`
 	// Model 是创建会话时使用的模型。
 	Model string `json:"model"`
-	// LastChain 是上一次完整请求链的哈希，用于幂等重放。
+	// LastChain 是上一次完整请求用户链的哈希，用于幂等重放。
 	LastChain string `json:"last_chain,omitempty"`
-	// LastReply 是 LastChain 对应的完整回复文本；客户端重试同一链时直接回放缓存，
-	// 避免重复消耗上游轮次。
+	// LastReply 是 LastChain 对应的完整回复文本。
 	LastReply string `json:"last_reply,omitempty"`
-	// UpdatedAt 用于空闲会话回收。
+	// UpdatedAt 用于空闲会话回收与平局决胜。
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// messageHash 对一条消息计算稳定哈希。助手消息只按纯文本哈希——
-// 客户端回传的我们生成的回复可能重排 content block，但文本一致。
+func (s *session) hasReply(hash string) bool {
+	for _, r := range s.Replies {
+		if r == hash {
+			return true
+		}
+	}
+	return false
+}
+
+// messageHash 对一条消息计算稳定哈希。助手回复指纹只按纯文本：
+// 客户端回传时可能重排 content block，但可见文本一致。
 func messageHash(message llm.Message) string {
 	var b strings.Builder
 	b.WriteString(string(message.Role()))
@@ -48,8 +72,6 @@ func messageHash(message llm.Message) string {
 	case llm.UserMessage:
 		writeBlocks(&b, m.Content)
 	case llm.ToolResultMessage:
-		b.WriteString(m.ToolName)
-		b.WriteByte(0)
 		writeBlocks(&b, m.Content)
 	case llm.AssistantMessage:
 		writeBlocks(&b, m.Content)
@@ -74,13 +96,76 @@ func writeBlocks(b *strings.Builder, content []llm.Content) {
 	}
 }
 
-// chainOf 返回整个请求链的逐消息哈希。
-func chainOf(messages []llm.Message) []string {
-	hashes := make([]string, len(messages))
-	for i, message := range messages {
-		hashes[i] = messageHash(message)
+// userChainOf 返回只含用户/工具结果消息的匹配链：用户消息是客户端输入，
+// 逐字节可信；助手回声可能经客户端重排，不进链。
+func userChainOf(messages []llm.Message) []string {
+	var hashes []string
+	for _, message := range messages {
+		switch message.(type) {
+		case llm.UserMessage, llm.ToolResultMessage:
+			hashes = append(hashes, messageHash(message))
+		}
 	}
 	return hashes
+}
+
+// lastAssistantHash 返回最后一条助手消息的文本指纹（-1 表示没有）。
+func lastAssistantHash(messages []llm.Message) (int, string) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if m, ok := messages[i].(llm.AssistantMessage); ok {
+			return i, messageHash(m)
+		}
+	}
+	return -1, ""
+}
+
+// firstUserText 返回首条用户消息的纯文本（session 收养的 title 匹配依据）。
+func firstUserText(messages []llm.Message) string {
+	for _, message := range messages {
+		if m, ok := message.(llm.UserMessage); ok {
+			return flatten(m.Content)
+		}
+	}
+	return ""
+}
+
+// tailAfter 返回消耗了 consumed 条非助手消息之后的剩余消息；
+// 开头的助手回声（我们自己产出的内容）被跳过——devin 已经知道它说过什么。
+func tailAfter(messages []llm.Message, consumed int) []llm.Message {
+	if consumed <= 0 {
+		return messages
+	}
+	seen, idx := 0, -1
+	for i, message := range messages {
+		switch message.(type) {
+		case llm.UserMessage, llm.ToolResultMessage:
+			seen++
+			if seen == consumed {
+				idx = i
+			}
+		}
+	}
+	if idx < 0 {
+		return messages
+	}
+	tail := messages[idx+1:]
+	for len(tail) > 0 {
+		if _, ok := tail[0].(llm.AssistantMessage); ok {
+			tail = tail[1:]
+		} else {
+			break
+		}
+	}
+	return tail
+}
+
+// matchResult 描述一次匹配。
+type matchResult struct {
+	session  *session
+	// consumed 是已消费的非助手消息条数（非下标）。
+	consumed int
+	// replay 为 true 时整条链已消费过 → 直接回放缓存回复。
+	replay bool
 }
 
 // sessionStore 是线程安全的「消息链前缀 → devin session」注册表。
@@ -89,12 +174,13 @@ type sessionStore struct {
 	path     string
 	ttl      time.Duration
 	sessions map[string]*session
+	byConv   map[string]string // conversation_id → sessionId
 	// busy 串行化同一会话的轮次（同一对话不应并发 prompt）。
 	busy map[string]*sync.Mutex
 }
 
 func newSessionStore(path string, ttl time.Duration) (*sessionStore, error) {
-	store := &sessionStore{path: path, ttl: ttl, sessions: map[string]*session{}, busy: map[string]*sync.Mutex{}}
+	store := &sessionStore{path: path, ttl: ttl, sessions: map[string]*session{}, byConv: map[string]string{}, busy: map[string]*sync.Mutex{}}
 	if path == "" {
 		return store, nil
 	}
@@ -110,59 +196,149 @@ func newSessionStore(path string, ttl time.Duration) (*sessionStore, error) {
 		return nil, fmt.Errorf("decode acp session store %s: %w", path, err)
 	}
 	for _, s := range list {
-		if s != nil && s.ID != "" {
-			store.sessions[s.ID] = s
+		if s == nil || s.ID == "" {
+			continue
+		}
+		store.sessions[s.ID] = s
+		if s.Conversation != "" {
+			store.byConv[s.Conversation] = s.ID
 		}
 	}
 	return store, nil
 }
 
-// matchResult 描述一次匹配：选中的会话（可能为 nil = 新建）及应新消费的尾部消息下标。
-type matchResult struct {
-	session  *session
-	consumed int
-}
-
-// match 按最长共同前缀找会话。规则：
-//   - 与 LastChain 完全相等 → 命中幂等缓存（返回 lastReply 即可）。
-//   - 最长唯一前缀的会话胜出；多个会话并列同一长度（对话分叉且前缀相同）
-//     → 返回 nil 新建会话，避免把新聊天挂到别人的上下文上。
-func (store *sessionStore) match(chain []string) matchResult {
+// match 按「严格前缀延伸 + 回复指纹」找会话：
+//   - conversation_id 命中：直接取对应会话；其链非 incoming 前缀 → 视分叉，新建。
+//   - 否则：候选 = 链是 incoming 严格前缀的会话；
+//     优先含 anchor 者 → 链最长 → 最近活跃。无候选 → 新建。
+//   - 完全相等且 ≥2 条 → 幂等重放。
+//   - turn-1（单条用户消息且无显式 id）直接返回新建。
+func (store *sessionStore) match(messages []llm.Message, chain []string, conversationID string) matchResult {
+	if len(chain) <= 1 && conversationID == "" {
+		return matchResult{}
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.pruneLocked()
 	joined := strings.Join(chain, ",")
-	var best *session
-	tie := false
-	for _, s := range store.sessions {
-		n := 0
-		for n < len(s.Chain) && n < len(chain) && s.Chain[n] == chain[n] {
-			n++
+
+	if conversationID != "" {
+		if id, ok := store.byConv[conversationID]; ok {
+			if s := store.sessions[id]; s != nil {
+				if s.LastChain == joined && s.LastReply != "" {
+					return matchResult{session: s, replay: true}
+				}
+				// 显式 id 的会话总是 resume：客户端可以不重放历史，
+				// consumed = 已消费前缀条数；分叉也不切会话——prompt 由
+				// tailAfter(前缀) 或 lastUserPrompt 兜底。
+				return matchResult{session: s, consumed: prefixLen(s.Chain, chain)}
+			}
 		}
-		if n == 0 {
-			continue
-		}
-		if best == nil || n > matchLen(best, chain) {
-			best, tie = s, false
-		} else if n == matchLen(best, chain) && s != best {
-			tie = true
-		}
-	}
-	if best != nil && best.LastChain == joined && best.LastReply != "" {
-		return matchResult{session: best, consumed: len(chain)}
-	}
-	if tie || best == nil {
+		// 带显式 id 的分叉不 fallback 到链匹配，避免串会话。
 		return matchResult{}
 	}
-	return matchResult{session: best, consumed: matchLen(best, chain)}
+
+	// 标签锚定：回复中内嵌的 <!--d2a:<sid>--> 被客户端原样回传时，
+	// 直接定位到产生该回复的会话——最精确的匹配。
+	if sid := lastSessionTag(messages); sid != "" {
+		if s := store.sessions[sid]; s != nil {
+			if isPrefix(s.Chain, chain) && len(s.Chain) < len(chain) {
+				return matchResult{session: s, consumed: len(s.Chain)}
+			}
+			if s.LastChain == joined && s.LastReply != "" {
+				return matchResult{session: s, replay: true}
+			}
+			// 标签命中但链已分叉 → 继续启发式，最终多半开新会话。
+		}
+	}
+
+	anchorIdx, anchorHash := lastAssistantHash(messages)
+	var best *session
+	bestScore := -1
+	for _, s := range store.sessions {
+		if !isPrefix(s.Chain, chain) {
+			continue
+		}
+		if len(s.Chain) == len(chain) {
+			if s.LastChain == joined && s.LastReply != "" {
+				return matchResult{session: s, replay: true}
+			}
+			continue
+		}
+		// 评分：anchor 命中 > 链长 > 最近活跃。完全相同时取最近活跃者——
+		// 此时两条链的前缀逐字节相同，上下文等价。
+		score := len(s.Chain)
+		if anchorIdx >= 0 && s.hasReply(anchorHash) {
+			score += 1 << 20
+		}
+		if best == nil || score > bestScore || (score == bestScore && s.UpdatedAt.After(best.UpdatedAt)) {
+			best, bestScore = s, score
+		}
+	}
+	if best == nil {
+		return matchResult{}
+	}
+	return matchResult{session: best, consumed: len(best.Chain)}
 }
 
-func matchLen(s *session, chain []string) int {
+func isPrefix(prefix, full []string) bool {
+	return prefixLen(prefix, full) == len(prefix)
+}
+
+func prefixLen(prefix, full []string) int {
 	n := 0
-	for n < len(s.Chain) && n < len(chain) && s.Chain[n] == chain[n] {
+	for n < len(prefix) && n < len(full) && prefix[n] == full[n] {
 		n++
 	}
 	return n
+}
+
+// sessionTag 是嵌入回复尾部的会话指纹标记（HTML 注释，markdown 渲染不可见）。
+const sessionTagPrefix = "<!--d2a:"
+const sessionTagSuffix = "-->"
+
+// sessionTagFor 生成某会话的回复指纹标记。
+func sessionTagFor(sessionID string) string {
+	return "\n\n" + sessionTagPrefix + sessionID + sessionTagSuffix
+}
+
+// lastSessionTag 从后往前找助手消息中的会话标记；客户端回传原文时即指纹。
+func lastSessionTag(messages []llm.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m, ok := messages[i].(llm.AssistantMessage)
+		if !ok {
+			continue
+		}
+		for _, block := range m.Content {
+			text, ok := block.(llm.TextContent)
+			if !ok {
+				continue
+			}
+			if id := extractTag(text.Text); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func extractTag(text string) string {
+	start := strings.LastIndex(text, sessionTagPrefix)
+	if start < 0 {
+		return ""
+	}
+	rest := text[start+len(sessionTagPrefix):]
+	end := strings.Index(rest, sessionTagSuffix)
+	if end <= 0 {
+		return ""
+	}
+	id := rest[:end]
+	for _, r := range id {
+		if !(r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return ""
+		}
+	}
+	return id
 }
 
 // lock 返回会话级互斥锁，按 devin sessionId 串行化轮次。
@@ -177,13 +353,30 @@ func (store *sessionStore) lock(sessionID string) *sync.Mutex {
 	return m
 }
 
-// register 写入/更新会话的消费链并落盘；replyChain 是本轮完成后的完整请求链，
-// reply 是本轮回复文本（用于幂等重放）。
-func (store *sessionStore) register(s *session, model string, chain []string, reply string) {
+// register 写入/更新会话的消费链并落盘。
+// chain 是本轮完成后的完整【用户链】；replyHash 是本轮回复指纹。
+func (store *sessionStore) register(s *session, model, conversationID string, chain []string, replyHash, reply string) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	s.Model = model
 	s.Chain = append([]string(nil), chain...)
+	if conversationID != "" {
+		s.Conversation = conversationID
+	}
+	if s.Conversation != "" {
+		store.byConv[s.Conversation] = s.ID
+	}
+	// 收养/重建会话时合并旧指纹，不丢历史回复锚点。
+	if old := store.sessions[s.ID]; old != nil && old != s {
+		for _, r := range old.Replies {
+			if !s.hasReply(r) {
+				s.Replies = append(s.Replies, r)
+			}
+		}
+	}
+	if replyHash != "" && !s.hasReply(replyHash) {
+		s.Replies = append(s.Replies, replyHash)
+	}
 	s.LastChain = strings.Join(chain, ",")
 	s.LastReply = reply
 	s.UpdatedAt = time.Now()
@@ -199,6 +392,9 @@ func (store *sessionStore) pruneLocked() {
 	for id, s := range store.sessions {
 		if s.UpdatedAt.Before(cutoff) {
 			delete(store.sessions, id)
+			if s.Conversation != "" {
+				delete(store.byConv, s.Conversation)
+			}
 		}
 	}
 }
