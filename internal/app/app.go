@@ -56,6 +56,8 @@ type App struct {
 	dashboard DashboardRegistrar
 	// apiKey 是可选的 OpenAI 兼容接口访问密钥；为空则不校验。
 	apiKey string
+	// cloud 是可选的 api.devin.ai sessions 透传客户端；nil 表示未启用。
+	cloud *devinCloudClient
 	// authStatus 返回上游 Devin 凭据的可用性与来源，供 /healthz 展示。
 	authStatus func() (bool, string)
 	// concurrency 限制同时处理的 /v1/* 请求数。
@@ -104,6 +106,11 @@ func (application *App) Router() http.Handler {
 		protected.Post("/v1/responses", application.createResponses)
 		protected.Post("/v1/chat/completions", application.createChatCompletions)
 		protected.Post("/v1/messages", application.createMessages)
+		// Devin Cloud Sessions REST API 透传（api.devin.ai）。
+		protected.Post("/v1/sessions", application.createDevinSession)
+		protected.Get("/v1/sessions", application.listDevinSessions)
+		protected.Get("/v1/sessions/{sessionID}", application.getDevinSession)
+		protected.Post("/v1/sessions/{sessionID}/message", application.messageDevinSession)
 	})
 	if application.dashboard != nil {
 		application.dashboard.Register(router)

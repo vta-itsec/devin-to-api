@@ -18,12 +18,29 @@ Adapted from [`leookun/devin-2api`](https://github.com/leookun/devin-2api)
 | `POST /v1/chat/completions` | OpenAI Chat Completions | `"chat-completions"` |
 | `POST /v1/responses` | OpenAI Responses (+ WebSocket on `GET`) | `"responses"` |
 | `POST /v1/messages` | Anthropic Messages | `"messages"` |
+| `POST /v1/sessions` | Devin Cloud Sessions REST (passthrough → `api.devin.ai`) | — |
+| `GET /v1/sessions` `GET /v1/sessions/{id}` `POST /v1/sessions/{id}/message` | Same passthrough | — |
 | `GET /v1/models` `GET /v1/models/{id}` | OpenAI model list | — |
 | `GET /healthz` | Liveness + Devin auth status | — |
 | `GET /panel` | Optional dashboard | — |
 
-All three support streaming (SSE) and non-streaming, tool calling, and
-vision-capable models.
+All three chat protocols support streaming (SSE) and non-streaming, tool
+calling, and vision-capable models.
+
+### Devin Cloud sessions passthrough
+
+`/v1/sessions*` forwards requests verbatim to `api.devin.ai` — body fields
+are untouched, so `prompt`, `snapshot_id`, `playbook_id`, `tags`,
+`unlisted`, `title` and future fields all work exactly as documented in
+Devin's API. Client auth stays `PROXY_API_KEY`; upstream auth is
+`DEVIN_API_KEY` (or `devin_cloud.api_key`). If no server key is set, callers
+can supply their own key per request via `X-Devin-Api-Key` (works even when
+`PROXY_API_KEY` occupies `Authorization`); with no header the client's
+`Authorization` is forwarded. A default `snapshot_id` can be injected on
+session creation via `devin_cloud.snapshot_id` /
+`DEVIN_CLOUD_SNAPSHOT_ID` (explicit `snapshot_id` in the request always
+wins). These are **async cloud Devins**, not chat replies — poll
+`GET /v1/sessions/{id}` for status.
 
 ## Backends: `connect` vs `acp` (session mode)
 
@@ -125,12 +142,14 @@ session token is the right (and only viable) choice**:
 | Type | Purpose | Works here? |
 | --- | --- | --- |
 | `devin auth login` session token (`devin-session-token$...`) | Authenticates the Devin CLI/IDE Connect API (`server.codeium.com`) — streaming LLM chat | ✅ yes |
-| Devin API key (`api.devin.ai`) | REST API that creates **async Devin Cloud sessions** (autonomous agents), not chat completions | ❌ different API |
-| PAT / service user (`devin_pat$...`, org service accounts) | Same `api.devin.ai` sessions REST surface, org-scoped | ❌ different API |
+| Devin API key (`api.devin.ai`) | REST API that creates **async Devin Cloud sessions** (autonomous agents), not chat completions | ✅ only via `/v1/sessions*` passthrough — not for chat |
+| PAT / service user (`devin_pat$...`, org service accounts) | Same `api.devin.ai` sessions REST surface, org-scoped | ✅ same passthrough, org-scoped |
 
 The `POST /v1/sessions` REST API does not return a chat completion — it spins
 up a long-running cloud Devin. A chat proxy needs the Connect
-`GetChatMessage` RPC, which only the session token can call.
+`GetChatMessage` RPC, which only the session token can call. Both surfaces
+are exposed side-by-side: chat endpoints use the session token, sessions
+endpoints use the API key.
 
 ## Quick start
 

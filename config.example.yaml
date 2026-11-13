@@ -38,6 +38,20 @@ devin:
 
   # Devin chat model UID；不填默认 adaptive（上游自动选路）。
   # 客户端请求里的 model 字段始终可以覆盖此值。
+
+# ====== Devin Cloud Sessions API 透传（api.devin.ai）======
+# 配置以下任一项即注册 /v1/sessions* 端点，请求原样转发到 api.devin.ai：
+#   POST /v1/sessions                      创建 session（body 原样透传：
+#                                         prompt/snapshot_id/playbook_id/tags 等官方字段全支持）
+#   GET  /v1/sessions                      列出 sessions
+#   GET  /v1/sessions/{session_id}         查询状态
+#   POST /v1/sessions/{session_id}/message 向 session 追加消息
+# devin_cloud:
+#   base_url: "https://api.devin.ai"
+#   api_key: ""            # 服务端注入的 Bearer key；或 env DEVIN_API_KEY。
+#                          # 留空则透传客户端自己的 Authorization（调用方自带 key）。
+#   snapshot_id: ""        # 可选默认快照：创建请求缺 snapshot_id 时自动注入。
+#                          # env DEVIN_CLOUD_SNAPSHOT_ID / DEVIN_CLOUD_BASE_URL
   # model: "adaptive"
 
   # 上游代理地址（可选）；支持 http://、https://、socks5://、socks5h://

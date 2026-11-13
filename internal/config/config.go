@@ -18,6 +18,9 @@ import (
 // DefaultDevinBaseURL 是 Devin Connect 服务的默认地址（与 devin CLI 一致）。
 const DefaultDevinBaseURL = "https://server.codeium.com"
 
+// DefaultDevinCloudBaseURL 是 Devin Cloud REST API 的默认地址。
+const DefaultDevinCloudBaseURL = "https://api.devin.ai"
+
 // DefaultModel 是未显式配置 devin.model 时使用的模型；adaptive 由上游自动选路。
 const DefaultModel = "adaptive"
 
@@ -27,6 +30,8 @@ type Config struct {
 	Server ServerConfig `yaml:"server"`
 	// Devin 保存 Devin Connect 上游配置。
 	Devin DevinConfig `yaml:"devin"`
+	// DevinCloud 保存 api.devin.ai sessions 透传配置。
+	DevinCloud DevinCloudConfig `yaml:"devin_cloud"`
 	// Debug 保存仅用于本地诊断的日志配置。
 	Debug DebugConfig `yaml:"debug"`
 	// Dashboard 保存管理面板配置。
@@ -80,6 +85,16 @@ type DevinConfig struct {
 
 	// AuthSource 描述上游凭据来源，用于启动日志与 /healthz 展示；不参与请求。
 	AuthSource string `yaml:"-"`
+}
+
+// DevinCloudConfig 保存 api.devin.ai Sessions REST API 透传配置。
+type DevinCloudConfig struct {
+	// BaseURL 是 api.devin.ai 基础地址；为空表示不注册 /v1/sessions* 端点。
+	BaseURL string `yaml:"base_url"`
+	// APIKey 是服务端注入的 Bearer key（DEVIN_API_KEY）；为空时透传客户端 Authorization。
+	APIKey string `yaml:"api_key"`
+	// SnapshotID 是可选默认快照：POST /v1/sessions 请求体缺 snapshot_id 时注入。
+	SnapshotID string `yaml:"snapshot_id"`
 }
 
 // DebugConfig 保存请求级调试日志配置。
@@ -169,6 +184,15 @@ func (config *Config) applyEnv() {
 	if v := os.Getenv("PROXY_API_KEY"); v != "" {
 		config.Auth.APIKey = v
 	}
+	if v := os.Getenv("DEVIN_API_KEY"); v != "" {
+		config.DevinCloud.APIKey = v
+	}
+	if v := os.Getenv("DEVIN_CLOUD_BASE_URL"); v != "" {
+		config.DevinCloud.BaseURL = v
+	}
+	if v := os.Getenv("DEVIN_CLOUD_SNAPSHOT_ID"); v != "" {
+		config.DevinCloud.SnapshotID = v
+	}
 	if v := os.Getenv("DASHBOARD_PASSWORD"); v != "" {
 		config.Dashboard.Password = v
 	}
@@ -207,6 +231,10 @@ func (config *Config) Validate() error {
 	}
 	if config.Devin.BaseURL == "" {
 		config.Devin.BaseURL = DefaultDevinBaseURL
+	}
+	// 配了 key 或 snapshot 而未显式给 base_url 时，默认指向 api.devin.ai。
+	if config.DevinCloud.BaseURL == "" && (config.DevinCloud.APIKey != "" || config.DevinCloud.SnapshotID != "") {
+		config.DevinCloud.BaseURL = DefaultDevinCloudBaseURL
 	}
 	if config.Devin.Model == "" {
 		config.Devin.Model = DefaultModel

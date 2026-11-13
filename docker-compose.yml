@@ -30,6 +30,12 @@ services:
       DEVIN_ACP_MODE: ${DEVIN_ACP_MODE:-bypass}
       # Alternative to the volume above:
       # DEVIN_SESSION_TOKEN: ${DEVIN_SESSION_TOKEN:-}
+      # Devin Cloud API key for /v1/sessions* passthrough (api.devin.ai).
+      # Leave empty to forward the client's own Bearer token instead.
+      DEVIN_API_KEY: ${DEVIN_API_KEY:-}
+      # Optional default snapshot injected into POST /v1/sessions when the
+      # request omits snapshot_id.
+      DEVIN_CLOUD_SNAPSHOT_ID: ${DEVIN_CLOUD_SNAPSHOT_ID:-}
     restart: unless-stopped
 
 # volumes:

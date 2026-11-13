@@ -90,6 +90,15 @@ func main() {
 	}
 	application := app.New(providerAdapter, serviceConfig.Server, debugManager)
 	application.SetAPIKey(serviceConfig.Auth.APIKey)
+	if serviceConfig.DevinCloud.BaseURL != "" {
+		application.SetDevinCloud(serviceConfig.DevinCloud)
+		keySource := "client bearer"
+		if serviceConfig.DevinCloud.APIKey != "" {
+			keySource = "DEVIN_API_KEY"
+		}
+		log.Printf("devin cloud sessions passthrough: %s (auth=%s, snapshot_default=%q)",
+			serviceConfig.DevinCloud.BaseURL, keySource, serviceConfig.DevinCloud.SnapshotID)
+	}
 	application.SetAuthStatus(func() (bool, string) { return configured.AuthStatus() })
 	application.SetDashboard(dashboard.New(serviceConfig.Dashboard.Password, serviceConfig.Devin.BaseURL, devinConfig.TokenProvider(), serviceConfig.Devin.Proxy, serviceConfig.Devin.ForceHTTP1 != nil && *serviceConfig.Devin.ForceHTTP1))
 	server := application.HTTPServer()
